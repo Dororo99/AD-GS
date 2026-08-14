@@ -10,6 +10,7 @@
 #
 
 import os
+import time
 import torch
 import numpy as np
 from random import randint
@@ -29,9 +30,51 @@ from scene.env import EnvironmentMap
 from scene.cameras import Camera
 from torch.utils.tensorboard import SummaryWriter
 
+
+_LPIPS_METRIC = None
+_LPIPS_UNAVAILABLE = False
+WANDB_EVAL_MEDIA_KEY = 'Eval Images/fixed_front_gt_render'
+WANDB_EVAL_STEP_KEY = 'Eval Images/iteration'
+
+
+class _SelectiveWandbMediaWriter:
+    """Allow exactly one W&B media key while preserving scalar sync.
+
+    The selected image bypasses TensorBoard to avoid storing and uploading it
+    twice. All other image calls are dropped; non-media methods continue
+    through the real SummaryWriter.
+    """
+
+    def __init__(self, writer, wandb_run):
+        self._writer = writer
+        self._wandb_run = wandb_run
+
+    def __getattr__(self, name):
+        return getattr(self._writer, name)
+
+    def add_image(
+        self, tag, img_tensor, global_step=None, walltime=None,
+        dataformats='CHW',
+    ):
+        del walltime
+        if tag != WANDB_EVAL_MEDIA_KEY:
+            return
+        if dataformats != 'CHW':
+            raise ValueError(
+                'Selected W&B preview must use CHW, got {}'.format(dataformats)
+            )
+        import wandb
+        image = img_tensor.detach().cpu().permute(1, 2, 0).numpy()
+        self._wandb_run.log({
+            WANDB_EVAL_STEP_KEY: int(global_step or 0),
+            WANDB_EVAL_MEDIA_KEY: wandb.Image(image),
+        })
+
+
+
 def training(dataset, opt, pipe, testing_iterations, saving_iterations, debug_from):
     first_iter = 0
-    tb_writer = prepare_output_and_logger(dataset)
+    tb_writer, wandb_run = prepare_output_and_logger(dataset, opt, pipe)
 
     gaussians = GaussianModel(dataset.sh_degree, dataset.order_args)
     env_map = EnvironmentMap(**dataset.env_args)
@@ -42,9 +85,11 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, debug_fr
 
     viewpoint_stack = None
     ema_loss_for_log = 0.0
+    training_start_time = time.time()
     progress_bar = tqdm(range(first_iter, opt.iterations), desc="Training progress")
     first_iter += 1
     for iteration in range(first_iter, opt.iterations + 1):
+        iteration_start_time = time.time()
         gaussians.update_learning_rate(iteration)
 
         # Every 1000 its we increase the levels of SH up to a maximum degree
@@ -94,7 +139,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, debug_fr
             obj_loss = torch.nn.functional.binary_cross_entropy(pred_semantic[0], (gt_semantic > 0).float())
 
         if opt.lambda_sky > 0.0:
-            gt_sky = viewpoint_cam.sky.cuda()
+            gt_sky = viewpoint_cam.sky.cuda().float()
             pred_sky = torch.clip(render_pkg['img_opacity'], 1e-3, 1.0 - 1e-3)
             sky_loss = torch.nn.functional.binary_cross_entropy(1.0 - pred_sky, gt_sky)
         
@@ -125,6 +170,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, debug_fr
             'sky_loss': sky_loss,
             'sigma_loss': sigma_loss,
             'reg_loss': reg_loss,
+            'reg_sigma_loss': reg_sigma_loss,
         }
 
         with torch.no_grad():
@@ -166,7 +212,487 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, debug_fr
                 gaussians.optimizer.zero_grad(set_to_none=True)
                 env_map.optimizer.zero_grad(set_to_none=True)
 
-def prepare_output_and_logger(args):
+            iteration_seconds = time.time() - iteration_start_time
+            _report_training_runtime(
+                tb_writer,
+                iteration,
+                opt.iterations,
+                iteration_seconds,
+                training_start_time,
+                ema_loss_for_log,
+                scene,
+            )
+
+    tb_writer.flush()
+    tb_writer.close()
+    if wandb_run is not None:
+        wandb_run.finish()
+
+
+def _wandb_is_enabled():
+    value = os.getenv('WANDB_ENABLED', '0').strip().lower()
+    if value in ('1', 'true', 'yes', 'on'):
+        return True
+    if value in ('0', 'false', 'no', 'off'):
+        return False
+    raise ValueError(
+        "WANDB_ENABLED must be one of 1/0, true/false, yes/no, on/off"
+    )
+
+
+def _read_nonnegative_int_env(name, default):
+    raw_value = os.getenv(name, str(default)).strip()
+    try:
+        value = int(raw_value)
+    except ValueError as error:
+        raise ValueError("{} must be an integer".format(name)) from error
+    if value < 0:
+        raise ValueError(
+            "{} must be greater than or equal to zero".format(name)
+        )
+    return value
+
+
+def _read_bool_env(name, default):
+    raw_value = os.getenv(name, '1' if default else '0').strip().lower()
+    if raw_value in ('1', 'true', 'yes', 'on'):
+        return True
+    if raw_value in ('0', 'false', 'no', 'off'):
+        return False
+    raise ValueError(
+        "{} must be one of 1/0, true/false, yes/no, on/off".format(name)
+    )
+
+
+def _format_duration(seconds):
+    seconds = max(0, int(seconds))
+    hours, remainder = divmod(seconds, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    return "{:02d}:{:02d}:{:02d}".format(hours, minutes, seconds)
+
+
+def _should_log_wandb_preview(iteration, total_iterations):
+    if not _wandb_is_enabled():
+        return False
+    interval = _read_nonnegative_int_env('WANDB_EVAL_INTERVAL', 500)
+    if interval == 0:
+        return False
+    return iteration % interval == 0 or iteration == total_iterations
+
+
+def _should_log_wandb_scalars(iteration, total_iterations):
+    interval = _read_nonnegative_int_env(
+        'WANDB_SCALAR_LOG_INTERVAL', 10
+    )
+    if interval == 0:
+        return False
+    return (
+        iteration == 1
+        or iteration % interval == 0
+        or iteration == total_iterations
+    )
+
+
+def _select_fixed_eval_cameras(cameras, camera_id, count):
+    """Pick stable, time-spaced held-out views for GT/render comparisons."""
+    if count <= 0:
+        return []
+    matching = [
+        camera for camera in cameras if int(camera.cam_id) == camera_id
+    ]
+    candidates = matching if matching else list(cameras)
+    candidates = sorted(
+        candidates,
+        key=lambda camera: (
+            float(camera.time),
+            str(camera.image_name),
+            int(camera.uid),
+        ),
+    )
+    if len(candidates) <= count:
+        return candidates
+    if count == 1:
+        return [candidates[len(candidates) // 2]]
+    indices = [
+        int(round(position * (len(candidates) - 1) / float(count - 1)))
+        for position in range(count)
+    ]
+    return [candidates[index] for index in indices]
+
+
+def _build_gt_render_grid(image_pairs):
+    """Build a CHW grid whose rows are [ground truth | rendered image]."""
+    rows = []
+    for ground_truth, rendered in image_pairs:
+        height = min(ground_truth.shape[1], rendered.shape[1])
+        width = min(ground_truth.shape[2], rendered.shape[2])
+        ground_truth = ground_truth[:, :height, :width]
+        rendered = rendered[:, :height, :width]
+        rows.append(torch.cat((ground_truth, rendered), dim=2))
+    if not rows:
+        raise ValueError("At least one GT/render image pair is required")
+    max_width = max(row.shape[2] for row in rows)
+    padded_rows = []
+    for row in rows:
+        if row.shape[2] < max_width:
+            padding = torch.zeros(
+                row.shape[0],
+                row.shape[1],
+                max_width - row.shape[2],
+                dtype=row.dtype,
+                device=row.device,
+            )
+            row = torch.cat((row, padding), dim=2)
+        padded_rows.append(row)
+    return torch.cat(padded_rows, dim=1)
+
+
+def _get_lpips_metric(device):
+    global _LPIPS_METRIC, _LPIPS_UNAVAILABLE
+    if _LPIPS_UNAVAILABLE or not _read_bool_env('WANDB_EVAL_LPIPS', True):
+        return None
+    if _LPIPS_METRIC is None:
+        try:
+            from lpipsPyTorch import LPIPS
+            _LPIPS_METRIC = LPIPS(net_type='alex').eval().to(device)
+        except Exception as error:
+            _LPIPS_UNAVAILABLE = True
+            print(
+                "[W&B][WARNING] LPIPS initialization failed; continuing "
+                "without LPIPS: {}".format(error),
+                flush=True,
+            )
+            return None
+    return _LPIPS_METRIC
+
+
+def _fixed_eval_cameras(scene):
+    cache_name = '_wandb_fixed_eval_cameras'
+    if not hasattr(scene, cache_name):
+        camera_id = _read_nonnegative_int_env('WANDB_EVAL_CAMERA_ID', 0)
+        count = _read_nonnegative_int_env('WANDB_EVAL_IMAGE_COUNT', 3)
+        cameras = _select_fixed_eval_cameras(
+            scene.getTestCameras(), camera_id, count
+        )
+        if not cameras:
+            raise RuntimeError(
+                "W&B preview logging requires at least one validation camera"
+            )
+        setattr(scene, cache_name, cameras)
+        print(
+            "[W&B] fixed eval camera_id={} views={}".format(
+                camera_id,
+                ','.join(camera.image_name for camera in cameras),
+            ),
+            flush=True,
+        )
+    return getattr(scene, cache_name)
+
+
+@torch.no_grad()
+def _report_wandb_preview(
+    tb_writer, iteration, total_iterations, scene, render_func, render_args
+):
+    if not _should_log_wandb_preview(iteration, total_iterations):
+        return
+
+    cameras = _fixed_eval_cameras(scene)
+    image_pairs = []
+    l1_values = []
+    psnr_values = []
+    ssim_values = []
+    lpips_values = []
+    lpips_metric = None
+    render_seconds = 0.0
+    used_cuda = False
+
+    for viewpoint in cameras:
+        if viewpoint.original_image.is_cuda:
+            torch.cuda.synchronize(viewpoint.original_image.device)
+        render_start_time = time.time()
+        render_pkg = render_func(
+            viewpoint, scene.gaussians, scene.env_map, *render_args
+        )
+        image = torch.clamp(render_pkg['render'], 0.0, 1.0)
+        if image.is_cuda:
+            torch.cuda.synchronize(image.device)
+            used_cuda = True
+        render_seconds += time.time() - render_start_time
+        gt_image = torch.clamp(
+            viewpoint.original_image.to(image.device), 0.0, 1.0
+        )
+        height = min(gt_image.shape[1], image.shape[1])
+        width = min(gt_image.shape[2], image.shape[2])
+        gt_image = gt_image[:, :height, :width]
+        image = image[:, :height, :width]
+        l1_values.append(l1_loss(image, gt_image).double())
+        psnr_values.append(
+            psnr(image[None], gt_image[None]).mean().double()
+        )
+        ssim_values.append(ssim(image, gt_image).double())
+
+        if lpips_metric is None:
+            lpips_metric = _get_lpips_metric(image.device)
+        if lpips_metric is not None:
+            lpips_values.append(
+                lpips_metric(
+                    image[None] * 2.0 - 1.0,
+                    gt_image[None] * 2.0 - 1.0,
+                ).mean().double()
+            )
+        image_pairs.append(
+            (
+                gt_image.detach().cpu(),
+                image.detach().cpu(),
+            )
+        )
+
+    render_seconds = max(render_seconds, 1e-9)
+    comparison_grid = _build_gt_render_grid(image_pairs)
+    tb_writer.add_image(
+        'Eval Images/fixed_front_gt_render',
+        comparison_grid,
+        global_step=iteration,
+    )
+    tb_writer.add_scalar(
+        'Eval Images Metrics/fixed_front_l1',
+        torch.stack(l1_values).mean(),
+        iteration,
+    )
+    tb_writer.add_scalar(
+        'Eval Images Metrics/fixed_front_psnr',
+        torch.stack(psnr_values).mean(),
+        iteration,
+    )
+    tb_writer.add_scalar(
+        'Eval Images Metrics/fixed_front_ssim',
+        torch.stack(ssim_values).mean(),
+        iteration,
+    )
+    if lpips_values:
+        tb_writer.add_scalar(
+            'Eval Images Metrics/fixed_front_lpips',
+            torch.stack(lpips_values).mean(),
+            iteration,
+        )
+    tb_writer.add_scalar(
+        'Eval Images Metrics/fixed_front_render_fps',
+        len(cameras) / render_seconds,
+        iteration,
+    )
+    tb_writer.flush()
+    print(
+        "[W&B][PREVIEW] iter={} logged {} fixed GT|Render pairs "
+        "(PSNR={:.3f}, SSIM={:.4f})".format(
+            iteration,
+            len(cameras),
+            torch.stack(psnr_values).mean().item(),
+            torch.stack(ssim_values).mean().item(),
+        ),
+        flush=True,
+    )
+    if used_cuda:
+        torch.cuda.empty_cache()
+
+
+def _report_training_runtime(
+    tb_writer,
+    iteration,
+    total_iterations,
+    iteration_seconds,
+    training_start_time,
+    ema_loss,
+    scene,
+):
+    elapsed_seconds = max(time.time() - training_start_time, 1e-9)
+    iterations_per_second = iteration / elapsed_seconds
+    eta_seconds = (total_iterations - iteration) / max(
+        iterations_per_second, 1e-9
+    )
+    if _should_log_wandb_scalars(iteration, total_iterations):
+        tb_writer.add_scalar(
+            'Train Performance/iteration_wall_time_ms',
+            iteration_seconds * 1000.0,
+            iteration,
+        )
+        tb_writer.add_scalar(
+            'Train Performance/iterations_per_second',
+            iterations_per_second,
+            iteration,
+        )
+        tb_writer.add_scalar(
+            'Train Performance/eta_seconds', eta_seconds, iteration
+        )
+        tb_writer.add_scalar(
+            'GPU Memory/allocated_mb',
+            torch.cuda.memory_allocated() / (1024.0 ** 2),
+            iteration,
+        )
+        tb_writer.add_scalar(
+            'GPU Memory/reserved_mb',
+            torch.cuda.memory_reserved() / (1024.0 ** 2),
+            iteration,
+        )
+        tb_writer.add_scalar(
+            'GPU Memory/peak_allocated_mb',
+            torch.cuda.max_memory_allocated() / (1024.0 ** 2),
+            iteration,
+        )
+        tb_writer.add_scalar(
+            'points/total_points', scene.gaussians.get_pts_num, iteration
+        )
+        tb_writer.add_scalar(
+            'points/scene_points',
+            scene.gaussians.get_scene_pts_num,
+            iteration,
+        )
+        tb_writer.add_scalar(
+            'points/obj_points', scene.gaussians.get_obj_pts_num, iteration
+        )
+        tb_writer.add_scalar(
+            'model/active_sh_degree',
+            scene.gaussians.active_sh_degree,
+            iteration,
+        )
+        dynamic_lr_names = {
+            'scene_xyz',
+            'obj_xyz',
+            'deform_xyz',
+            'deform_background',
+        }
+        for param_group in scene.gaussians.optimizer.param_groups:
+            if param_group.get('name') in dynamic_lr_names:
+                tb_writer.add_scalar(
+                    'learning_rate/{}'.format(param_group['name']),
+                    param_group['lr'],
+                    iteration,
+                )
+        for param_group in scene.env_map.optimizer.param_groups:
+            tb_writer.add_scalar(
+                'learning_rate/{}'.format(
+                    param_group.get('name', 'env')
+                ),
+                param_group['lr'],
+                iteration,
+            )
+
+    console_interval = _read_nonnegative_int_env(
+        'ADGS_CONSOLE_LOG_INTERVAL', 100
+    )
+    should_log_console = console_interval > 0 and (
+        iteration == 1
+        or iteration % console_interval == 0
+        or iteration == total_iterations
+    )
+    if should_log_console:
+        scene_name = os.getenv('ADGS_SCENE_NAME', 'unknown-scene')
+        physical_gpu = os.getenv('ADGS_PHYSICAL_GPU', '?')
+        print(
+            "\n[TRAIN] scene={} gpu={} iter={}/{} ({:.1f}%) "
+            "loss={:.6f} points={} speed={:.2f}it/s elapsed={} "
+            "eta={} gpu_mem={:.0f}MB".format(
+                scene_name,
+                physical_gpu,
+                iteration,
+                total_iterations,
+                100.0 * iteration / total_iterations,
+                ema_loss,
+                scene.gaussians.get_pts_num,
+                iterations_per_second,
+                _format_duration(elapsed_seconds),
+                _format_duration(eta_seconds),
+                torch.cuda.memory_allocated() / (1024.0 ** 2),
+            ),
+            flush=True,
+        )
+        tb_writer.flush()
+
+
+def _initialize_wandb(args, opt, pipe):
+    """Start one scene-level W&B run and mirror the TensorBoard stream."""
+    if not _wandb_is_enabled():
+        return None
+
+    required = ('WANDB_ENTITY', 'WANDB_PROJECT', 'WANDB_NAME')
+    missing = [name for name in required if not os.getenv(name)]
+    if missing:
+        raise RuntimeError(
+            "W&B logging is enabled but variables are missing: {}".format(
+                ', '.join(missing)
+            )
+        )
+    try:
+        import wandb
+    except ImportError as error:
+        raise RuntimeError(
+            "W&B logging is enabled but wandb is not installed"
+        ) from error
+
+    split_type = os.getenv('WANDB_SPLIT_TYPE', 'SplatAD')
+    dataset_type = os.getenv('WANDB_DATASET_TYPE', '')
+    model_name = os.getenv('WANDB_MODEL_NAME', 'AD-GS')
+    config = {
+        'model': dict(vars(args)),
+        'optimization': dict(vars(opt)),
+        'pipeline': dict(vars(pipe)),
+        'logging': {
+            'eval_interval': _read_nonnegative_int_env(
+                'WANDB_EVAL_INTERVAL', 500
+            ),
+            'eval_image_count': _read_nonnegative_int_env(
+                'WANDB_EVAL_IMAGE_COUNT', 3
+            ),
+            'eval_camera_id': _read_nonnegative_int_env(
+                'WANDB_EVAL_CAMERA_ID', 0
+            ),
+            'eval_lpips': _read_bool_env('WANDB_EVAL_LPIPS', True),
+            'scalar_interval': _read_nonnegative_int_env(
+                'WANDB_SCALAR_LOG_INTERVAL', 10
+            ),
+            'console_interval': _read_nonnegative_int_env(
+                'ADGS_CONSOLE_LOG_INTERVAL', 100
+            ),
+        },
+        'experiment': {
+            'split_type': split_type,
+            'dataset_type': dataset_type,
+            'model_name': model_name,
+            'scene': os.path.basename(os.path.normpath(args.source_path)),
+        },
+    }
+    tags = [
+        value for value in (split_type, dataset_type, model_name) if value
+    ]
+    run = wandb.init(
+        entity=os.environ['WANDB_ENTITY'],
+        project=os.environ['WANDB_PROJECT'],
+        name=os.environ['WANDB_NAME'],
+        group=os.getenv('WANDB_RUN_GROUP') or None,
+        job_type='train',
+        dir=args.model_path,
+        config=config,
+        tags=tags,
+        sync_tensorboard=True,
+        save_code=False,
+    )
+    if run is None:
+        raise RuntimeError("wandb.init returned no run")
+    run.define_metric(WANDB_EVAL_STEP_KEY)
+    run.define_metric(
+        WANDB_EVAL_MEDIA_KEY, step_metric=WANDB_EVAL_STEP_KEY
+    )
+    print(
+        "[W&B] run={} mode={} url={}".format(
+            run.name,
+            os.getenv('WANDB_MODE', 'online'),
+            getattr(run, 'url', None) or '(offline/no URL)',
+        ),
+        flush=True,
+    )
+    return run
+
+
+def prepare_output_and_logger(args, opt, pipe):
     if not args.model_path:
         if os.getenv('OAR_JOB_ID'):
             unique_str=os.getenv('OAR_JOB_ID')
@@ -180,13 +706,31 @@ def prepare_output_and_logger(args):
     with open(os.path.join(args.model_path, "cfg_args"), 'w') as cfg_log_f:
         cfg_log_f.write(str(Namespace(**vars(args))))
 
-    # Create Tensorboard writer
+    # Initialize W&B before constructing SummaryWriter so TensorBoard events
+    # are mirrored into the scene-level W&B run from the first scalar onward.
+    wandb_run = _initialize_wandb(args, opt, pipe)
     tb_writer = SummaryWriter(args.model_path)
-    return tb_writer
+    if wandb_run is not None:
+        tb_writer = _SelectiveWandbMediaWriter(tb_writer, wandb_run)
+    return tb_writer, wandb_run
 
 def training_report(tb_writer, iteration, losses, opt, testing_iterations, scene : Scene, renderFunc, renderArgs):
-    for l_name, l_value in losses.items():
-        tb_writer.add_scalar('train_loss_patches/{}'.format(l_name), l_value, iteration)
+    if not _wandb_is_enabled() or _should_log_wandb_scalars(
+        iteration, opt.iterations
+    ):
+        for l_name, l_value in losses.items():
+            tb_writer.add_scalar(
+                'train_loss_patches/{}'.format(l_name), l_value, iteration
+            )
+
+    _report_wandb_preview(
+        tb_writer,
+        iteration,
+        opt.iterations,
+        scene,
+        renderFunc,
+        renderArgs,
+    )
 
     # Report test and samples of training set
     if iteration in testing_iterations:
@@ -235,11 +779,18 @@ def training_report(tb_writer, iteration, losses, opt, testing_iterations, scene
                         if iteration == min(testing_iterations):
                             tb_writer.add_image(config['name'] + "_view_{}/ground_truth".format(viewpoint.image_name), gt_image, global_step=iteration)
                             tb_writer.add_image(config['name'] + "_view_{}/depth_gt".format(viewpoint.image_name), gt_depth.repeat(3, 1, 1), global_step=iteration)
-                            tb_writer.add_image(config['name'] + "_view_{}/sky_gt".format(viewpoint.image_name), viewpoint.sky[None].repeat(3, 1, 1), global_step=iteration)
+                            tb_writer.add_image(config['name'] + "_view_{}/sky_gt".format(viewpoint.image_name), viewpoint.sky[None].repeat(3, 1, 1).float(), global_step=iteration)
                             tb_writer.add_image(config['name'] + "_view_{}/obj_gt".format(viewpoint.image_name), gt_obj[None].repeat(3, 1, 1), global_step=iteration)
                             if gt_flow_pkg is not None:
                                 tb_writer.add_image(config['name'] + "_view_{}/flow_gt".format(viewpoint.image_name), flow_to_img(gt_flow, gt_flow_vis), global_step=iteration)
-                            
+
+                        tb_writer.add_image(
+                            config['name'] + "_view_{}/gt_render".format(
+                                viewpoint.image_name
+                            ),
+                            _build_gt_render_grid(((gt_image, image),)),
+                            global_step=iteration,
+                        )
                         tb_writer.add_image(config['name'] + "_view_{}/render".format(viewpoint.image_name), image, global_step=iteration)
                         tb_writer.add_image(config['name'] + "_view_{}/opacity".format(viewpoint.image_name), render_pkg['img_opacity'].repeat(3, 1, 1), global_step=iteration)
                         tb_writer.add_image(config['name'] + "_view_{}/depth".format(viewpoint.image_name), depthmap.repeat(3, 1, 1), global_step=iteration)

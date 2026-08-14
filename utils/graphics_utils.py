@@ -79,6 +79,39 @@ def getProjectionMatrix(znear, zfar, fovX, fovY):
     P[2, 3] = -(zfar * znear) / (zfar - znear)
     return P
 
+
+def getProjectionMatrixFromIntrinsics(
+    znear, zfar, fx, fy, cx, cy, width, height
+):
+    """Create the rasterizer projection matrix for a full pinhole camera.
+
+    ``cx`` and ``cy`` use the standard calibration convention in which pixel
+    centers are sampled at ``(x + 0.5, y + 0.5)``.  The bundled Inria
+    rasterizer instead represents pixel centers by integer array indices, so
+    the optical axis must map to ``(cx - 0.5, cy - 0.5)``.
+    """
+    values = np.asarray(
+        [znear, zfar, fx, fy, cx, cy, width, height], dtype=np.float64
+    )
+    if not np.isfinite(values).all():
+        raise ValueError("Projection parameters must be finite")
+    if znear <= 0 or zfar <= znear:
+        raise ValueError("Expected 0 < znear < zfar")
+    if fx <= 0 or fy <= 0 or width <= 0 or height <= 0:
+        raise ValueError("Focal lengths and image dimensions must be positive")
+
+    P = torch.zeros(4, 4)
+    P[0, 0] = 2.0 * float(fx) / float(width)
+    P[1, 1] = 2.0 * float(fy) / float(height)
+    P[0, 2] = 2.0 * float(cx) / float(width) - 1.0
+    P[1, 2] = 2.0 * float(cy) / float(height) - 1.0
+    P[3, 2] = 1.0
+    P[2, 2] = float(zfar) / (float(zfar) - float(znear))
+    P[2, 3] = -(float(zfar) * float(znear)) / (
+        float(zfar) - float(znear)
+    )
+    return P
+
 def fov2focal(fov, pixels):
     return pixels / (2 * math.tan(fov / 2))
 

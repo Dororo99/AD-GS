@@ -8,7 +8,7 @@
 ### Install
 
 ```shell
-git clone https://github.com/JiaweiXu8/AD-GS.git
+git clone https://github.com/Dororo99/AD-GS.git
 cd AD-GS
 
 conda env create -f environment.yaml
@@ -244,16 +244,181 @@ cd ..
 
 # segment pcd based on the object masks
 conda activate AD-GS
-bash scripts/nuscenes/segment-pcd.sh
+bash scripts/nuscene/segment-pcd.sh
 
 # optical flow
-bash scripts/nuscenes/prepare-flow.sh
+bash scripts/nuscene/prepare-flow.sh
 
 # colmap
-bash scripts/nuscenes/prepare-colmap.sh
+bash scripts/nuscene/prepare-colmap.sh
 ```
 
 </details>
+
+## SplatAD 50% LINSPACE protocol (Waymo, nuScenes, AV2)
+
+For this selected-scene experiment, this section supersedes the older upstream
+Waymo and nuScenes examples above. The launchers do not use the old eight Waymo
+validation scenes or the six cropped nuScenes examples.
+
+The launchers below contain the selected 10 scenes for each dataset and reproduce
+the SplatAD/NeurAD **data protocol**:
+
+- Waymo: `FRONT`, `FRONT_LEFT`, `FRONT_RIGHT`, and `TOP` LiDAR.
+- nuScenes: all six cameras and `LIDAR_TOP`, including each full asynchronous
+  `sample_data` chain.
+- AV2: all seven ring cameras in SplatAD's camera-major order. Each physical
+  LiDAR sweep contributes independent `lidar_up` and `lidar_down` observation
+  entries, matching the parser's two-sensor metadata layout; the physical sweep
+  itself is read only once when constructing the initialization cloud.
+
+The 50% LINSPACE split is applied independently to every camera and LiDAR
+sensor. For a sensor with `N` observations, train contains `ceil(N * 0.5)`
+indices from `np.linspace(0, N - 1, ..., dtype=int64)` and val is the exact
+complement. This is intentionally not a global even/odd split. Initialization
+`points3d.ply` is built only from independently selected train LiDAR sweeps;
+held-out LiDAR is rejected by both the loader and preflight validator. The
+Waymo converter also uses SplatAD's exposure-center pose and timestamp computed
+from each `CameraImage` pose, velocity, trigger time, and readout-done time.
+All selected camera and LiDAR timestamps share SplatAD's common sensor-time
+origin. AD-GS stores that same common interval normalized linearly to `[0, 1]`;
+`frame_gap` is the median train-camera spacing divided by the common duration.
+
+Raw symlinks remain under `data/{nuscenes,waymo,av2}`. Converted scenes are
+written separately under `data/processed/<dataset>`:
+
+```shell
+# nuScenes: six cameras, full asynchronous sample_data chains
+VALIDATE_ONLY=1 bash scripts/nuscene/prepare-nuscenes.sh
+bash scripts/nuscene/prepare-nuscenes.sh
+
+# Waymo training split: FRONT, FRONT_LEFT, FRONT_RIGHT and TOP LiDAR
+bash scripts/waymo/prepare-waymo.sh
+
+# AV2 physical train split: all seven ring cameras
+bash scripts/av2/prepare-av2.sh --validate_only
+bash scripts/av2/prepare-av2.sh
+```
+
+Immediately after conversion, metadata and train-only LiDAR can be checked with
+`--metadata-only`:
+
+```shell
+/venv/ad-gs/bin/python scripts/validate_splatad_scene.py \
+    data/processed/nuscenes/scene-0101 --dataset nuscenes --metadata-only
+```
+
+Then prepare all required AD-GS priors for each converted scene. The integrated
+launcher runs DPT, camera-isolated Grounded-SAM-2, flow, point segmentation, and
+headless CPU COLMAP in a private work area. It verifies the complete result
+before installing it, preserves the unsegmented PLY, and refuses existing priors
+unless `OVERWRITE=1` is explicitly set.
+
+Priors are streamed one scene and one camera at a time. Depth is stored as
+compressed `float16` and restored to `float32` (maximum normalized quantization
+error `5e-4`), semantic/sky preserve their nonzero binary masks losslessly by
+bit-packing, and flow remains exact in compressed NPZ form. Legacy NPY/NPZ
+priors remain readable. A conservative planning estimate for all 30 scenes is
+about 354 GiB, but actual flow compression is data-dependent. The end-to-end
+launchers use a scene-scoped lock per physical GPU. Duplicate builders on the
+same GPU are serialized, while nuScenes on GPU 4 and AV2 on GPU 5 can preprocess
+concurrently in isolated scene workspaces. They check a 100 GiB free-space floor
+before every prior and train/render scene
+and stop without deleting staging if the floor is crossed. This estimate
+excludes converted images/PLY/COLMAP data and training checkpoints or renders,
+so continue monitoring `df -h` and apply an explicit output-retention policy
+instead of automatic deletion.
+
+```shell
+# Inspect one scene without writing or running inference.
+DRY_RUN=1 bash scripts/prepare_splatad_priors.sh \
+    nuscenes data/processed/nuscenes/scene-0101 4
+
+# Run one scene per dataset; repeat for every scene in its dataset launcher.
+bash scripts/prepare_splatad_priors.sh \
+    nuscenes data/processed/nuscenes/scene-0101 4
+bash scripts/prepare_splatad_priors.sh \
+    waymo data/processed/waymo/4986495627634617319_2980_000_3000_000 6
+bash scripts/prepare_splatad_priors.sh \
+    av2 data/processed/av2/a7bcdabb-f9b7-3c16-806d-3ddf1c2d49a2 5
+```
+
+The direct training launchers validate every scene before creating a worker.
+nuScenes uses physical GPU 4 and AV2 uses physical GPU 5; each launcher passes
+the same GPU twice to run one worker in scene-list order. Waymo likewise uses
+one configurable GPU. On completion, `render.py --skip_train` evaluates the
+complete validation complement.
+
+Use the end-to-end launchers when priors are incomplete. They strictly skip
+ready scenes, apply `RESUME=1` only to manifest-validated staging, build all
+remaining priors, and then invoke the single-GPU training batch.
+
+```shell
+# Inspect both end-to-end pipelines without acquiring locks or writing.
+PIPELINE_DRY_RUN=1 bash scripts/run_nuscenes_preprocess_then_train.sh
+PIPELINE_DRY_RUN=1 bash scripts/run_av2_preprocess_then_train.sh
+
+# End-to-end: nuScenes -> GPU 4, AV2 -> GPU 5.
+bash scripts/run_nuscenes_preprocess_then_train.sh
+bash scripts/run_av2_preprocess_then_train.sh
+
+# Direct training only, when every prior is already ready.
+bash scripts/train_nuscenes_splatad.sh
+bash scripts/train_waymo_splatad.sh
+bash scripts/train_av2_splatad.sh
+```
+
+These launchers enable live W&B logging by default and mirror the existing
+TensorBoard scalars/images into one run per scene. The entity is
+`CamoSplat_ICLR_2027`; the convention `[SplitType]_[DatasetType]_[Model]`
+produces these projects for the AD-GS baseline:
+
+- `SplatAD_nuScenes_AD-GS`
+- `SplatAD_Waymo_AD-GS`
+- `SplatAD_Argoverse2_AD-GS`
+
+Following the reference SplatAD logger, every 500 iterations AD-GS selects
+three deterministic held-out views from the front camera (camera ID 0). It
+logs one image grid with ground truth on the left and the current render on
+the right for each row. The same views also report L1, PSNR, SSIM, LPIPS, and
+render FPS. Training logs additionally include all native loss components,
+dynamic learning rates, iteration speed/ETA, GPU memory, active SH degree,
+and total/scene/object Gaussian counts.
+
+The terminal prints a plain-text heartbeat every 100 iterations, plus
+scene-level `TRAIN START`, `TRAIN DONE/FAILED`, `RENDER START`,
+`RENDER DONE/FAILED`, elapsed time, and the W&B URL. The complete stdout and
+stderr stream remains visible in the terminal and is also saved to
+`<output-root>/<scene>/launcher.log`.
+
+Before launching any worker, the batch validates every configured scene and
+prints `READY` or `NEEDS_PRIORS` for each one. If a scene is incomplete, no
+training starts and the summary prints the exact full-prior preparation command.
+An interrupted `.adgs-priors-work` is first validated and resumed explicitly
+with `RESUME=1`. The launchers never enable `OVERWRITE=1`, delete staging, or
+fabricate a missing point-cloud `obj` field automatically; invalid staging
+requires manual inspection.
+
+Each run name is the scene ID and runs are grouped by project. Defaults can be
+overridden without editing the scripts, for example
+`WANDB_MODE=offline`, `WANDB_ENABLED=0`, `WANDB_PROJECT=...`, or
+`WANDB_RUN_NAME_PREFIX=debug-`. Logging cadence can be adjusted with
+`WANDB_EVAL_INTERVAL`, `WANDB_EVAL_IMAGE_COUNT`,
+`WANDB_SCALAR_LOG_INTERVAL`, and `ADGS_CONSOLE_LOG_INTERVAL`. Set
+`WANDB_EVAL_LPIPS=0` to omit the optional LPIPS calculation.
+
+This parity statement covers the selected sensors, observation ordering,
+per-sensor split, camera calibration/crops, Waymo exposure-center pose, and
+train-only LiDAR seed. AD-GS is still a different model and uses a single
+center-time pinhole pose; it does not reproduce SplatAD's per-column Waymo
+rolling-shutter renderer (about 54 ms readout in the checked segment). It also
+does not reproduce SplatAD's point-level rolling-LiDAR timing/return supervision
+or synthetic missing-return augmentation (`add_missing_points`): AD-GS has no
+LiDAR-ray loss and uses measured first-return points for initialization.
+
+The setup step only prepares code, environments, checkpoints, and launchers. It
+does not start full conversion, prior generation, or training; those jobs begin
+only when the commands above are invoked.
 
 ## Run
 

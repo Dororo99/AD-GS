@@ -12,7 +12,11 @@
 import torch
 from torch import nn
 import numpy as np
-from utils.graphics_utils import getWorld2View2, getProjectionMatrix
+from utils.graphics_utils import (
+    getWorld2View2,
+    getProjectionMatrix,
+    getProjectionMatrixFromIntrinsics,
+)
 
 class Camera(nn.Module):
     def __init__(
@@ -35,7 +39,8 @@ class Camera(nn.Module):
             depth=None, 
             semantic=None, 
             sky=None,
-            flow=None
+            flow=None,
+            intrinsics=None,
         ):
         super(Camera, self).__init__()
 
@@ -60,6 +65,18 @@ class Camera(nn.Module):
         self.original_image = image.clamp(0.0, 1.0)
         self.image_width = self.original_image.shape[2]
         self.image_height = self.original_image.shape[1]
+        self.intrinsics = None
+        self.fx = self.fy = self.cx = self.cy = None
+        if intrinsics is not None:
+            intrinsics = np.asarray(intrinsics, dtype=np.float64).reshape(-1)
+            if intrinsics.shape != (4,) or not np.isfinite(intrinsics).all():
+                raise ValueError("intrinsics must be finite [fx, fy, cx, cy]")
+            if intrinsics[0] <= 0.0 or intrinsics[1] <= 0.0:
+                raise ValueError("Camera focal lengths must be positive")
+            self.intrinsics = intrinsics.astype(np.float32)
+            self.fx, self.fy, self.cx, self.cy = [
+                float(value) for value in self.intrinsics
+            ]
         self.depth = depth
         self.semantic = semantic
         self.sky = sky
@@ -75,7 +92,25 @@ class Camera(nn.Module):
         self.scale = scale
 
         self.world_view_transform = torch.tensor(getWorld2View2(R, T, trans, scale)).transpose(0, 1)
-        self.projection_matrix = getProjectionMatrix(znear=self.znear, zfar=self.zfar, fovX=self.FoVx, fovY=self.FoVy).transpose(0,1)
+        if self.intrinsics is None:
+            projection_matrix = getProjectionMatrix(
+                znear=self.znear,
+                zfar=self.zfar,
+                fovX=self.FoVx,
+                fovY=self.FoVy,
+            )
+        else:
+            projection_matrix = getProjectionMatrixFromIntrinsics(
+                znear=self.znear,
+                zfar=self.zfar,
+                fx=self.fx,
+                fy=self.fy,
+                cx=self.cx,
+                cy=self.cy,
+                width=self.image_width,
+                height=self.image_height,
+            )
+        self.projection_matrix = projection_matrix.transpose(0, 1)
         self.full_proj_transform = (self.world_view_transform.unsqueeze(0).bmm(self.projection_matrix.unsqueeze(0))).squeeze(0)
         self.camera_center = self.world_view_transform.inverse()[3, :3]
 
@@ -112,4 +147,3 @@ class MiniCam:
         view_inv = torch.inverse(self.world_view_transform)
         self.camera_center = view_inv[3][:3]
         self.time = time_stamp
-

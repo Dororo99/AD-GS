@@ -1,5 +1,6 @@
 import os
 import argparse
+import sys
 import numpy as np
 import torch
 from plyfile import PlyData, PlyElement
@@ -10,6 +11,69 @@ from waymo_open_dataset import dataset_pb2
 import tqdm
 from PIL import Image
 os.environ['CUDA_VISIBLE_DEVICES'] = ""
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from splatad_split import (
+    normalized_train_frame_gap,
+    sensor_time_bounds,
+    splatad_is_val_mask,
+)
+
+
+def splatad_camera_midpoint_pose(camera_image):
+    """Extrapolate the Waymo SDC pose to the image-center exposure time.
+
+    This intentionally mirrors NeurAD/SplatAD's ``ExportImages.process``:
+    Waymo supplies the SDC pose and global-frame linear/angular velocity at
+    ``pose_timestamp``; the reference advances that pose with a first-order
+    constant-velocity model to the midpoint between camera trigger and final
+    readout.  Do not project the updated rotation back onto SO(3), since the
+    reference also keeps the first-order matrix as-is.
+    """
+    pose = np.asarray(camera_image.pose.transform, dtype=np.float64).reshape(4, 4)
+    pose_timestamp = float(camera_image.pose_timestamp)
+    trigger_time = float(camera_image.camera_trigger_time)
+    readout_done_time = float(camera_image.camera_readout_done_time)
+    center_time = (trigger_time + readout_done_time) / 2.0
+    delta_time = center_time - pose_timestamp
+
+    linear_velocity = np.array(
+        [
+            camera_image.velocity.v_x,
+            camera_image.velocity.v_y,
+            camera_image.velocity.v_z,
+        ],
+        dtype=np.float64,
+    )
+    angular_velocity = np.array(
+        [
+            camera_image.velocity.w_x,
+            camera_image.velocity.w_y,
+            camera_image.velocity.w_z,
+        ],
+        dtype=np.float64,
+    )
+    wx, wy, wz = angular_velocity
+    skew = np.array(
+        [[0.0, -wz, wy], [wz, 0.0, -wx], [-wy, wx, 0.0]],
+        dtype=np.float64,
+    )
+
+    centered_pose = np.eye(4, dtype=np.float64)
+    centered_pose[:3, :3] = (
+        np.eye(3, dtype=np.float64) + delta_time * skew
+    ) @ pose[:3, :3]
+    centered_pose[:3, 3] = pose[:3, 3] + delta_time * linear_velocity
+    return (
+        centered_pose,
+        center_time,
+        pose_timestamp,
+        trigger_time,
+        readout_done_time,
+        linear_velocity,
+        angular_velocity,
+    )
+
 
 def storePly(path, xyz, rgb, t=None):
     # Define the dtype for the structured array
@@ -87,6 +151,7 @@ def convert_range_image_to_point_cloud_flow(
     range_images,
     range_image_top_pose,
     ri_index=0,
+    laser_names=None,
 ):
     """
     Modified from the codes of Waymo Open Dataset.
@@ -127,6 +192,8 @@ def convert_range_image_to_point_cloud_flow(
         range_image_top_pose_tensor_rotation, range_image_top_pose_tensor_translation
     )
     for c in calibrations:
+        if laser_names is not None and c.name not in laser_names:
+            continue
         range_image = range_images[c.name][ri_index]
         if len(c.beam_inclinations) == 0:  # pylint: disable=g-explicit-length-test
             beam_inclinations = range_image_utils.compute_inclination(
@@ -309,10 +376,11 @@ parser = argparse.ArgumentParser()
 parser.add_argument("src")
 parser.add_argument("dst")
 parser.add_argument("--part", default="training")
-parser.add_argument("--first_frame", default=65, type=int)
-parser.add_argument("--last_frame", default=120, type=int)
+parser.add_argument("--first_frame", default=0, type=int)
+parser.add_argument("--last_frame", default=-1, type=int)
 parser.add_argument("--downsample_ratio", '-r', default=1.0, type=float)
-parser.add_argument("--select_camera", default=[0], type=int, nargs='+')
+parser.add_argument("--select_camera", default=[0, 1, 2], type=int, nargs='+')
+parser.add_argument("--train_split_fraction", default=0.5, type=float)
 parser.add_argument("--use_color", action='store_true')
 parser.add_argument("--use_depth", action='store_true')
 args = parser.parse_args()
@@ -335,11 +403,47 @@ Ks = []
 pcd = []
 pcd_rgb = []
 time_stamps = []
+frame_ids = []
+camera_ids = []
+image_heights = []
+image_widths = []
 is_val_list = []
+camera_pose_time_stamps = []
+camera_trigger_time_stamps = []
+camera_readout_done_time_stamps = []
+camera_time_to_center_offsets = []
+camera_readout_durations = []
+camera_rolling_shutter_directions = []
+camera_linear_velocities_global = []
+camera_angular_velocities_global = []
 dataset = tf.data.TFRecordDataset(args.src, compression_type="")
 if last_frame == -1:
     last_frame = len([_ for _ in dataset]) - 1
-val_fid_list = get_val_frames(last_frame - first_frame + 1, 4)
+assert 0 <= first_frame <= last_frame
+assert len(args.select_camera) == len(set(args.select_camera))
+assert all(0 <= camera_id <= 4 for camera_id in args.select_camera)
+num_selected_frames = last_frame - first_frame + 1
+split_camera_ids = np.tile(
+    np.asarray(args.select_camera, dtype=np.int64), num_selected_frames
+)
+split_is_val = splatad_is_val_mask(
+    split_camera_ids, args.train_split_fraction
+).reshape(num_selected_frames, len(args.select_camera))
+lidar_frame_ids = np.arange(num_selected_frames, dtype=np.int64)
+lidar_time_stamps = np.empty(num_selected_frames, dtype=np.float32)
+lidar_is_val_list = splatad_is_val_mask(
+    np.zeros(num_selected_frames, dtype=np.int64),
+    args.train_split_fraction,
+)
+camera_names_all = np.array([
+    'FRONT',
+    'FRONT_LEFT',
+    'FRONT_RIGHT',
+    'SIDE_LEFT',
+    'SIDE_RIGHT',
+])
+selected_camera_names = camera_names_all[args.select_camera]
+time_origin = None
 process_bar = tqdm.tqdm(range(last_frame - first_frame + 1), desc="Processing")
 for fid, data in enumerate(dataset):
     if fid < first_frame or (last_frame != -1 and fid > last_frame):
@@ -350,8 +454,12 @@ for fid, data in enumerate(dataset):
     ego_to_world = np.array(frame.pose.transform).reshape(4, 4)
     if fid == first_frame:
         ego_0 = np.linalg.inv(ego_to_world)
+        time_origin = frame.timestamp_micros / 1e6
     ego_to_world = ego_0 @ ego_to_world
-    is_val = (fid - first_frame) in val_fid_list
+    local_frame_id = fid - first_frame
+    frame_time_stamp = frame.timestamp_micros / 1e6 - time_origin
+    lidar_time_stamps[local_frame_id] = frame_time_stamp
+    frame_is_val = split_is_val[local_frame_id]
 
     range_images, range_image_top_pose = parse_range_image_and_camera_projection(frame)
 
@@ -366,18 +474,22 @@ for fid, data in enumerate(dataset):
         range_images,
         range_image_top_pose,
         ri_index=0,
+        laser_names=(dataset_pb2.LaserName.TOP,),
     )
+    assert len(points) == 1, "SplatAD parity requires exactly the TOP LiDAR"
     points = np.concatenate(points, axis=0)
     points = ego_to_world[:3, :3] @ points[..., None] + ego_to_world[:3, 3:]
 
     mask_total = np.full((points.shape[0],), dtype=np.bool_, fill_value=False)
     points_color = np.zeros((points.shape[0], 3), dtype=np.float32)
     counts = 0
-    # for idx, (img, cam) in enumerate(zip(frame.images, frame.context.camera_calibrations)):
-    for idx, img in enumerate(frame.images):
-        # if idx not in args.select_camera:
-        if img.name - 1 not in args.select_camera:
-            continue
+    images_by_id = {img.name - 1: img for img in frame.images}
+    for selected_position, camera_id in enumerate(args.select_camera):
+        assert camera_id in images_by_id, (
+            "Frame {} is missing selected camera {}".format(fid, camera_id)
+        )
+        img = images_by_id[camera_id]
+        is_val = bool(frame_is_val[selected_position])
 
         cam = [c for c in frame.context.camera_calibrations if c.name == img.name][0]
 
@@ -392,21 +504,47 @@ for fid, data in enumerate(dataset):
             [0.0, 0.0, 1.0],
         ], dtype=np.float32)
 
-        # cam_ego_to_world = np.array(img.pose.transform).reshape(4, 4)
-        # cam_ego_to_world = ego_0 @ cam_ego_to_world
-        # RT_inv = cam_ego_to_world @ np.array(cam.extrinsic.transform).reshape(4, 4) @ OPENCV2DATASET
-
-        RT_inv = ego_to_world @ np.array(cam.extrinsic.transform).reshape(4, 4) @ OPENCV2DATASET
+        (
+            centered_ego_to_world,
+            camera_center_time,
+            camera_pose_time,
+            camera_trigger_time,
+            camera_readout_done_time,
+            camera_linear_velocity,
+            camera_angular_velocity,
+        ) = splatad_camera_midpoint_pose(img)
+        centered_ego_to_world = ego_0 @ centered_ego_to_world
+        RT_inv = (
+            centered_ego_to_world
+            @ np.array(cam.extrinsic.transform).reshape(4, 4)
+            @ OPENCV2DATASET
+        )
         RT = np.linalg.inv(RT_inv)
         RTs.append(RT)
-        time_stamps.append(fid - first_frame)
+        time_stamps.append(camera_center_time - time_origin)
+        frame_ids.append(local_frame_id)
+        camera_ids.append(camera_id)
         is_val_list.append(is_val)
+        camera_pose_time_stamps.append(camera_pose_time - time_origin)
+        camera_trigger_time_stamps.append(camera_trigger_time - time_origin)
+        camera_readout_done_time_stamps.append(
+            camera_readout_done_time - time_origin
+        )
+        camera_time_to_center_offsets.append(camera_center_time - camera_pose_time)
+        camera_readout_durations.append(
+            camera_readout_done_time - camera_trigger_time
+        )
+        camera_rolling_shutter_directions.append(cam.rolling_shutter_direction)
+        camera_linear_velocities_global.append(camera_linear_velocity)
+        camera_angular_velocities_global.append(camera_angular_velocity)
 
         proj_pts = (K @ (RT[:3, :3] @ points + RT[:3, 3:])).squeeze(-1)
         mask = (proj_pts[:, 2] > 0.0)
         depth = proj_pts[..., 2]
         proj_pts = proj_pts[..., :2] / proj_pts[..., 2:]
         W, H = Image.open(img_path).size
+        image_heights.append(H)
+        image_widths.append(W)
         mask = np.bitwise_and(mask, np.bitwise_and(proj_pts[..., 0] >= 0.0, proj_pts[..., 0] <= W - 1))
         mask = np.bitwise_and(mask, np.bitwise_and(proj_pts[..., 1] >= 0.0, proj_pts[..., 1] <= H - 1))
         if args.use_depth:
@@ -430,7 +568,11 @@ for fid, data in enumerate(dataset):
                 points_color[mask] += torch.nn.functional.grid_sample(img[None], proj_pts[None, None], align_corners=True).squeeze().permute(1, 0).detach().cpu().numpy()[mask]
                 counts += np.float32(mask)
 
-    if not is_val:
+    assert np.all(frame_is_val == frame_is_val[0]), (
+        "Equal-length Waymo cameras must share the temporal LINSPACE mask"
+    )
+    assert bool(lidar_is_val_list[local_frame_id]) == bool(frame_is_val[0])
+    if not bool(lidar_is_val_list[local_frame_id]):
         points = points.squeeze(-1)[mask_total]
         if args.use_color:
             points_color = points_color[mask_total]
@@ -441,7 +583,14 @@ for fid, data in enumerate(dataset):
             if args.use_color:
                 points_color = points_color[choice]
                 counts = counts[choice]
-        points = np.concatenate([points, np.full((points.shape[0], 1), dtype=np.float32, fill_value=fid - first_frame)], axis=-1)
+        points = np.concatenate([
+            points,
+            np.full(
+                (points.shape[0], 1),
+                dtype=np.float32,
+                fill_value=frame_time_stamp,
+            ),
+        ], axis=-1)
         pcd.append(points)
         if args.use_color:
             pcd_rgb.append(points_color / counts[..., None])
@@ -452,7 +601,19 @@ pcd = np.concatenate(pcd, axis=0)
 RTs = np.stack(RTs, axis=0)
 Ks = np.stack(Ks, axis=0)
 is_val_list = np.array(is_val_list, dtype=np.bool_)
-time_stamps = np.array(time_stamps, dtype=np.float32)
+time_stamps = np.array(time_stamps, dtype=np.float64)
+frame_ids = np.array(frame_ids, dtype=np.int64)
+camera_ids = np.array(camera_ids, dtype=np.int64)
+normalization_time_stamps = np.concatenate([time_stamps, lidar_time_stamps])
+sensor_time_min, sensor_time_max = sensor_time_bounds(
+    normalization_time_stamps
+)
+frame_gap = normalized_train_frame_gap(
+    time_stamps,
+    camera_ids,
+    is_val_list,
+    normalization_time_stamps=normalization_time_stamps,
+)
 
 if args.use_color:
     pcd_rgb = np.concatenate(pcd_rgb, axis=0) * 255.0
@@ -465,7 +626,47 @@ np.savez(
     T = RTs[..., :3, 3],
     K = Ks,
     time_stamps = time_stamps,
-    is_val_list = is_val_list
+    frame_ids = frame_ids,
+    camera_ids = camera_ids,
+    camera_names = selected_camera_names,
+    image_heights = np.array(image_heights, dtype=np.int64),
+    image_widths = np.array(image_widths, dtype=np.int64),
+    camera_pose_time_stamps = np.array(camera_pose_time_stamps, dtype=np.float64),
+    camera_trigger_time_stamps = np.array(camera_trigger_time_stamps, dtype=np.float64),
+    camera_readout_done_time_stamps = np.array(
+        camera_readout_done_time_stamps, dtype=np.float64
+    ),
+    camera_time_to_center_offsets = np.array(
+        camera_time_to_center_offsets, dtype=np.float64
+    ),
+    camera_readout_durations = np.array(camera_readout_durations, dtype=np.float64),
+    camera_rolling_shutter_directions = np.array(
+        camera_rolling_shutter_directions, dtype=np.int64
+    ),
+    camera_linear_velocities_global = np.array(
+        camera_linear_velocities_global, dtype=np.float64
+    ),
+    camera_angular_velocities_global = np.array(
+        camera_angular_velocities_global, dtype=np.float64
+    ),
+    is_val_list = is_val_list,
+    dataset_type = np.array('waymo'),
+    split_type = np.array('linspace'),
+    train_split_fraction = np.array(args.train_split_fraction, dtype=np.float32),
+    frame_gap = np.array(frame_gap, dtype=np.float32),
+    sensor_time_min = np.array(sensor_time_min, dtype=np.float64),
+    sensor_time_max = np.array(sensor_time_max, dtype=np.float64),
+    sensor_time_duration = np.array(
+        sensor_time_max - sensor_time_min, dtype=np.float64
+    ),
+    time_normalization_scope = np.array('all_cameras_all_lidars'),
+    lidar_names = np.array(['TOP']),
+    lidar_sensor_ids = np.zeros(
+        lidar_time_stamps.shape[0], dtype=np.int64
+    ),
+    lidar_frame_ids = lidar_frame_ids,
+    lidar_time_stamps = lidar_time_stamps,
+    lidar_is_val_list = lidar_is_val_list,
 )
 
 print("Get PCD:", pcd.shape)

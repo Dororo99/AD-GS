@@ -90,13 +90,25 @@ frame_names = [
     if os.path.splitext(p)[-1] in [".jpg", ".jpeg", ".JPG", ".JPEG", ".png", ".PNG"]
 ]
 frame_names.sort(key=lambda p: int(os.path.splitext(p)[0]))
+if not frame_names:
+    raise ValueError(f"No image frames found in: {video_dir}")
+
+
+def get_frame_dimensions(frame_name):
+    with Image.open(os.path.join(video_dir, frame_name)) as frame:
+        frame_width, frame_height = frame.size
+    return frame_height, frame_width
 
 # init video predictor state
 inference_state = video_predictor.init_state(video_path=video_dir, offload_video_to_cpu=True, async_loading_frames=True)
 step = args.step # the step to sample frames for Grounding DINO predictor
 # step = len(frame_names) # the step to sample frames for Grounding DINO predictor
 
-sam2_masks = MaskDictionaryModel()
+first_frame_height, first_frame_width = get_frame_dimensions(frame_names[0])
+sam2_masks = MaskDictionaryModel(
+    mask_height=first_frame_height,
+    mask_width=first_frame_width,
+)
 PROMPT_TYPE_FOR_VIDEO = "mask" # box, mask or point
 objects_count = 0
 
@@ -110,8 +122,14 @@ for start_frame_idx in range(0, len(frame_names), step):
     # continue
     img_path = os.path.join(video_dir, frame_names[start_frame_idx])
     image = Image.open(img_path)
+    frame_width, frame_height = image.size
     image_base_name = frame_names[start_frame_idx].split(".")[0]
-    mask_dict = MaskDictionaryModel(promote_type = PROMPT_TYPE_FOR_VIDEO, mask_name = f"mask_{image_base_name}.npy")
+    mask_dict = MaskDictionaryModel(
+        promote_type=PROMPT_TYPE_FOR_VIDEO,
+        mask_name=f"mask_{image_base_name}.npy",
+        mask_height=frame_height,
+        mask_width=frame_width,
+    )
 
     # run Grounding DINO on the image
     inputs = processor(images=image, text=text, return_tensors="pt").to(device)
@@ -167,11 +185,21 @@ for start_frame_idx in range(0, len(frame_names), step):
         print("objects_count", objects_count)
     else:
         print("No object detected in the frame, skip merge the frame merge {}".format(frame_names[start_frame_idx]))
-        mask_dict = sam2_masks
+        if len(sam2_masks.labels) != 0:
+            mask_dict = sam2_masks
 
     
     if len(mask_dict.labels) == 0:
-        mask_dict.save_empty_mask_and_json(mask_data_dir, json_data_dir, image_name_list = frame_names[start_frame_idx:start_frame_idx+step])
+        for empty_frame_name in frame_names[start_frame_idx:start_frame_idx+step]:
+            empty_frame_height, empty_frame_width = get_frame_dimensions(empty_frame_name)
+            empty_image_base_name = os.path.splitext(empty_frame_name)[0]
+            empty_mask_dict = MaskDictionaryModel(
+                promote_type=PROMPT_TYPE_FOR_VIDEO,
+                mask_name=f"mask_{empty_image_base_name}.npy",
+                mask_height=empty_frame_height,
+                mask_width=empty_frame_width,
+            )
+            empty_mask_dict.save_empty_mask_and_json(mask_data_dir, json_data_dir)
         print("No object detected in the frame, skip the frame {}".format(start_frame_idx))
         continue
     else: 
@@ -187,17 +215,26 @@ for start_frame_idx in range(0, len(frame_names), step):
         
         video_segments = {}  # output the following {step} frames tracking masks
         for out_frame_idx, out_obj_ids, out_mask_logits in video_predictor.propagate_in_video(inference_state, max_frame_num_to_track=step, start_frame_idx=start_frame_idx):
-            frame_masks = MaskDictionaryModel()
+            out_frame_name = frame_names[out_frame_idx]
+            out_frame_height, out_frame_width = get_frame_dimensions(out_frame_name)
+            out_image_base_name = os.path.splitext(out_frame_name)[0]
+            frame_masks = MaskDictionaryModel(
+                mask_name=f"mask_{out_image_base_name}.npy",
+                mask_height=out_frame_height,
+                mask_width=out_frame_width,
+            )
             
             for i, out_obj_id in enumerate(out_obj_ids):
                 out_mask = (out_mask_logits[i] > 0.0) # .cpu().numpy()
+                if tuple(out_mask.shape[-2:]) != (out_frame_height, out_frame_width):
+                    raise ValueError(
+                        "SAM tracking mask/image size mismatch for "
+                        f"{out_frame_name}: {tuple(out_mask.shape[-2:])} != "
+                        f"{(out_frame_height, out_frame_width)}"
+                    )
                 object_info = ObjectInfo(instance_id = out_obj_id, mask = out_mask[0], class_name = mask_dict.get_target_class_name(out_obj_id))
                 object_info.update_box()
                 frame_masks.labels[out_obj_id] = object_info
-                image_base_name = frame_names[out_frame_idx].split(".")[0]
-                frame_masks.mask_name = f"mask_{image_base_name}.npy"
-                frame_masks.mask_height = out_mask.shape[-2]
-                frame_masks.mask_width = out_mask.shape[-1]
 
             video_segments[out_frame_idx] = frame_masks
             sam2_masks = copy.deepcopy(frame_masks)

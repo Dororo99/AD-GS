@@ -10,6 +10,11 @@ from PIL import Image
 import imageio
 from itertools import combinations
 
+try:
+    from scripts.prior_storage import load_mask_prior
+except ImportError:  # Direct ``python scripts/segment_pcd.py`` execution.
+    from prior_storage import load_mask_prior
+
 class BasicPointCloud(NamedTuple):
     points : np.array
     colors : np.array
@@ -77,6 +82,20 @@ def get_val_frames(num_frames, test_every=None, train_every=None):
 
     return list(val_frames)
 
+
+def nearest_train_lidar_time(meta, camera_time):
+    """Map an asynchronous camera observation to a train-only LiDAR sweep."""
+    if 'lidar_time_stamps' not in meta.files:
+        return float(camera_time)
+    lidar_times = np.asarray(meta['lidar_time_stamps'], dtype=np.float64)
+    if 'lidar_is_val_list' in meta.files:
+        lidar_times = lidar_times[
+            ~np.asarray(meta['lidar_is_val_list'], dtype=np.bool_)
+        ]
+    if lidar_times.size == 0:
+        raise ValueError("No train LiDAR timestamps in metadata")
+    return float(lidar_times[np.argmin(np.abs(lidar_times - float(camera_time)))])
+
 def segment_waymo_pcd(path):
     pcd_path = os.path.join(path, 'points3d.ply')
     pcd = fetchPly(pcd_path)
@@ -98,13 +117,19 @@ def segment_waymo_pcd(path):
             [0.0, K[1], K[3]],
             [0.0, 0.0, 1.0],
         ], dtype=np.float32)
-        W, H = K[0, 2] * 2, K[1, 2] * 2
         K = torch.tensor(K, dtype=torch.float32, device='cuda')
         R = torch.tensor(R, dtype=torch.float32, device='cuda')
         T = torch.tensor(T, dtype=torch.float32, device='cuda')
 
-        selected_mask = (pcd_timestamp == fid) & (pcd_obj_segment == 0.0)
-        semantic_map = torch.tensor(np.load(semantic_path).astype(np.float32), dtype=torch.float32, device='cuda')
+        semantic_map = torch.tensor(load_mask_prior(semantic_path, "semantic").astype(np.float32), dtype=torch.float32, device='cuda')
+        H, W = semantic_map.shape[-2], semantic_map.shape[-1]
+        lidar_time = nearest_train_lidar_time(meta, fid)
+        selected_mask = torch.isclose(
+            pcd_timestamp,
+            torch.tensor(lidar_time, dtype=torch.float32, device='cuda'),
+            rtol=0.0,
+            atol=1e-4,
+        ) & (pcd_obj_segment == 0.0)
         proj_points = (K @ (R @ pcd_points[selected_mask][..., None] + T[..., None])).squeeze(-1)
         proj_mask = proj_points[..., 2] > 0.0
         proj_points = proj_points[..., :2] / proj_points[..., 2:]
@@ -159,7 +184,7 @@ def segment_kitti_pcd(path, split_mode='nvs-75'):
         T = torch.tensor(T, dtype=torch.float32, device='cuda')
 
         selected_mask = (pcd_timestamp == fid) & (pcd_obj_segment == 0.0)
-        semantic_map = torch.tensor(np.load(semantic_path).astype(np.float32), dtype=torch.float32, device='cuda')
+        semantic_map = torch.tensor(load_mask_prior(semantic_path, "semantic").astype(np.float32), dtype=torch.float32, device='cuda')
         proj_points = (K @ (R @ pcd_points[selected_mask][..., None] + T[..., None])).squeeze(-1)
         proj_mask = proj_points[..., 2] > 0.0
         proj_points = proj_points[..., :2] / proj_points[..., 2:]
@@ -196,9 +221,15 @@ def segment_nuscenes_pcd(path):
         R = torch.tensor(R, dtype=torch.float32, device='cuda')
         T = torch.tensor(T, dtype=torch.float32, device='cuda')
 
-        selected_mask = (pcd_timestamp == fid) & (pcd_obj_segment == 0.0)
-        semantic_map = torch.tensor(np.load(semantic_path).astype(np.float32), dtype=torch.float32, device='cuda')
+        semantic_map = torch.tensor(load_mask_prior(semantic_path, "semantic").astype(np.float32), dtype=torch.float32, device='cuda')
         H, W = semantic_map.shape[-2], semantic_map.shape[-1]
+        lidar_time = nearest_train_lidar_time(meta, fid)
+        selected_mask = torch.isclose(
+            pcd_timestamp,
+            torch.tensor(lidar_time, dtype=torch.float32, device='cuda'),
+            rtol=0.0,
+            atol=1e-4,
+        ) & (pcd_obj_segment == 0.0)
         proj_points = (K @ (R @ pcd_points[selected_mask][..., None] + T[..., None])).squeeze(-1)
         proj_mask = proj_points[..., 2] > 0.0
         proj_points = proj_points[..., :2] / proj_points[..., 2:]
@@ -228,7 +259,13 @@ if __name__ == "__main__":
         print("Found poses.npz file, assuming KITTI or vKITTI data set!")
         segment_kitti_pcd(args.path, args.split_mode)
     elif os.path.exists(os.path.join(args.path, 'meta.npz')):
-        print("Found meta.npz file, assuming nuScenes data set!")
+        with np.load(os.path.join(args.path, 'meta.npz'), allow_pickle=True) as meta:
+            dataset_type = (
+                str(np.asarray(meta['dataset_type']).item())
+                if 'dataset_type' in meta.files
+                else 'nuscenes'
+            )
+        print("Found meta.npz file for {} data set!".format(dataset_type))
         segment_nuscenes_pcd(args.path)
     else:
         assert False, 'Could not recognize scene type!'

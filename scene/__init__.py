@@ -52,7 +52,14 @@ class Scene:
             print("Found cameras.npz file, assuming Waymo data set!")
             scene_info = sceneLoadTypeCallbacks["Waymo"](args.source_path, args.use_colmap, args.num_cam)
         elif os.path.exists(os.path.join(args.source_path, "meta.npz")):
-            print("Found meta.npz file, assuming nuScenes data set!")
+            meta_path = os.path.join(args.source_path, "meta.npz")
+            with np.load(meta_path, allow_pickle=True) as meta:
+                dataset_type = (
+                    str(np.asarray(meta['dataset_type']).item())
+                    if 'dataset_type' in meta.files
+                    else 'nuscenes'
+                )
+            print("Found meta.npz file for {} data set!".format(dataset_type))
             scene_info = sceneLoadTypeCallbacks["nuScenes"](args.source_path, args.use_colmap, args.num_cam)
         else:
             assert False, "Could not recognize scene type!"

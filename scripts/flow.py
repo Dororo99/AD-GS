@@ -20,6 +20,15 @@ import argparse
 import tqdm
 import flow_vis
 
+try:
+    from scripts.prior_storage import (
+        load_flow_prior,
+        load_mask_prior,
+        save_flow_prior,
+    )
+except ImportError:  # Direct ``python scripts/flow.py`` execution.
+    from prior_storage import load_flow_prior, load_mask_prior, save_flow_prior
+
 def get_val_frames(num_frames, test_every=None, train_every=None):
     assert train_every is None or test_every is None
     if train_every is None:
@@ -385,11 +394,522 @@ def batchify(model, img, points, batch_size=2**15):
         pred_visibility.append(pkg[1][0])
     pred_tracks = torch.cat(pred_tracks, dim=1)
     pred_visibility = torch.cat(pred_visibility, dim=1)
-    return pred_tracks, pred_visibility[..., 0]
+    return pred_tracks, pred_visibility
+
+
+def _metadata_camera_ids(meta, num_images, num_cams, legacy_num_cams, dataset_name):
+    """Return camera ids, preferring the explicit converter metadata."""
+    if 'camera_ids' in meta.files:
+        camera_ids = np.asarray(meta['camera_ids'], dtype=np.int64).reshape(-1)
+        if camera_ids.shape[0] != num_images:
+            raise ValueError(
+                f'{dataset_name}: camera_ids has {camera_ids.shape[0]} entries, '
+                f'but metadata/images have {num_images}'
+            )
+        inferred = len(dict.fromkeys(camera_ids.tolist()))
+        if num_cams is not None and num_cams != inferred:
+            raise ValueError(
+                f'{dataset_name}: --cam/num_cams={num_cams} disagrees with '
+                f'metadata camera_ids ({inferred} cameras)'
+            )
+        return camera_ids
+
+    resolved_num_cams = legacy_num_cams if num_cams is None else num_cams
+    if resolved_num_cams is None or resolved_num_cams <= 0:
+        raise ValueError(f'{dataset_name}: a positive camera count is required')
+    if num_images % resolved_num_cams != 0:
+        raise ValueError(
+            f'{dataset_name}: {num_images} images are not divisible by the legacy '
+            f'camera count {resolved_num_cams}; regenerate metadata with camera_ids'
+        )
+    return np.arange(num_images, dtype=np.int64) % resolved_num_cams
+
+
+def _camera_groups(camera_ids, is_val_list, time_stamps):
+    """Group training observations by camera, preserving chronological order."""
+    groups = []
+    for camera_id in dict.fromkeys(camera_ids.tolist()):
+        indices = np.flatnonzero((camera_ids == camera_id) & ~is_val_list)
+        order = np.argsort(time_stamps[indices], kind='stable')
+        groups.append((int(camera_id), indices[order]))
+    return groups
+def _flow_resume_specs(path, img_list, camera_groups, time_stamps,
+                       downsample, slide_window):
+    """Describe the exact shape and target timestamps expected per train frame."""
+    specs = {}
+    image_root = os.path.join(path, 'image')
+    for _, group_indices in camera_groups:
+        if not len(group_indices):
+            continue
+        first_name = img_list[group_indices[0]]
+        with Image.open(os.path.join(image_root, first_name)) as image:
+            width, height = image.size
+        if downsample is not None and downsample > 1:
+            width //= downsample
+            height //= downsample
+        shape = (height, width)
+        for local_idx, global_idx in enumerate(group_indices):
+            stem = os.path.splitext(img_list[global_idx])[0]
+            target_times = []
+            if local_idx + slide_window < len(group_indices):
+                target_times.append(
+                    float(time_stamps[group_indices[local_idx + slide_window]])
+                )
+            if local_idx >= slide_window:
+                target_times.append(
+                    float(time_stamps[group_indices[local_idx - slide_window]])
+                )
+            if stem in specs:
+                raise ValueError('Duplicate training image stem: {}'.format(stem))
+            specs[stem] = {
+                'shape': shape,
+                'target_times': tuple(target_times),
+            }
+    return specs
+
+
+def _finite_numeric(value, label, path):
+    try:
+        array = np.asarray(value, dtype=np.float64)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            'Existing flow {} has non-numeric {}'.format(path, label)
+        ) from exc
+    if not np.isfinite(array).all():
+        raise ValueError(
+            'Existing flow {} has non-finite {}'.format(path, label)
+        )
+    return array
+
+
+def _validate_resumed_flow(path, flow, spec):
+    """Validate one persisted flow before allowing inference to skip it."""
+    flow = np.asarray(flow, dtype=object)
+    if flow.size == 0:
+        return
+    if flow.ndim != 2 or flow.shape[1] != 6:
+        raise ValueError(
+            'Existing flow {} has invalid shape {}; expected (N, 6)'.format(
+                path, flow.shape
+            )
+        )
+    target_times = spec['target_times']
+    if flow.shape[0] != len(target_times):
+        raise ValueError(
+            'Existing flow {} has {} directions; expected {}'.format(
+                path, flow.shape[0], len(target_times)
+            )
+        )
+    expected_shape = tuple(spec['shape'])
+    for direction, (row, expected_time) in enumerate(zip(flow, target_times)):
+        actual_time = float(_finite_numeric(
+            row[0], 'target timestamp', path
+        ).reshape(()))
+        if not np.isclose(actual_time, expected_time, rtol=1e-6, atol=1e-6):
+            raise ValueError(
+                'Existing flow {} direction {} targets {}, expected {}'.format(
+                    path, direction, actual_time, expected_time
+                )
+            )
+        for field_index, field_name in ((1, 'K'), (2, 'R'), (3, 'T')):
+            _finite_numeric(row[field_index], field_name, path)
+        coordinates = _finite_numeric(row[4], 'coordinates', path)
+        visibility = _finite_numeric(row[5], 'visibility', path)
+        if coordinates.shape != (2,) + expected_shape:
+            raise ValueError(
+                'Existing flow {} coordinates have shape {}; expected {}'.format(
+                    path, coordinates.shape, (2,) + expected_shape
+                )
+            )
+        if visibility.shape != expected_shape:
+            raise ValueError(
+                'Existing flow {} visibility has shape {}; expected {}'.format(
+                    path, visibility.shape, expected_shape
+                )
+            )
+
+
+def _preflight_flow_resume(flow_folder, specs):
+    """Validate every existing flow before any new model inference starts."""
+    candidates = [
+        name for name in os.listdir(flow_folder)
+        if os.path.isfile(os.path.join(flow_folder, name))
+        and os.path.splitext(name)[1] in ('.npy', '.npz')
+    ]
+    stems = [os.path.splitext(name)[0] for name in candidates]
+    duplicates = sorted({stem for stem in stems if stems.count(stem) > 1})
+    if duplicates:
+        raise ValueError(
+            'Flow resume found duplicate NPY/NPZ stems: {}'.format(duplicates[:3])
+        )
+    unexpected = sorted(set(stems) - set(specs))
+    if unexpected:
+        raise ValueError(
+            'Flow resume found non-training/unknown stems: {}'.format(
+                unexpected[:3]
+            )
+        )
+    path_by_stem = {
+        os.path.splitext(name)[0]: os.path.join(flow_folder, name)
+        for name in candidates
+    }
+    for stem in sorted(path_by_stem):
+        output_path = path_by_stem[stem]
+        flow = None
+        try:
+            flow = load_flow_prior(output_path)
+            _validate_resumed_flow(output_path, flow, specs[stem])
+        except Exception as exc:
+            raise ValueError(
+                'Cannot resume from existing flow {}: {}'.format(
+                    output_path, exc
+                )
+            ) from exc
+        finally:
+            del flow
+    ready = set(path_by_stem)
+    print(
+        '[RESUME][FLOW PREFLIGHT] ready={} missing={} total={}'.format(
+            len(ready), len(specs) - len(ready), len(specs)
+        )
+    )
+    return ready
+
+
+
+
+def _scaled_intrinsic(K, downsample):
+    K = np.asarray(K, dtype=np.float32).copy()
+    if downsample is None or downsample <= 1:
+        return K
+    if K.ndim == 1 and K.shape[0] >= 4:
+        K[:4] /= float(downsample)
+        return K
+    if K.shape == (3, 3):
+        K[:2] /= float(downsample)
+        return K
+    raise ValueError(f'Unsupported intrinsic shape: {K.shape}')
+
+
+def _waymo_intrinsic_matrix(K):
+    K = np.asarray(K, dtype=np.float32)
+    if K.shape == (3, 3):
+        return K
+    if K.ndim != 1 or K.shape[0] < 4:
+        raise ValueError(f'Unsupported Waymo intrinsic shape: {K.shape}')
+    return np.array([
+        [K[0], 0.0, K[2]],
+        [0.0, K[1], K[3]],
+        [0.0, 0.0, 1.0],
+    ], dtype=np.float32)
+
+
+def _stack_flow_preview(flow_video):
+    if not flow_video:
+        return None
+    shapes = {frame.shape for frame in flow_video}
+    if len(shapes) != 1:
+        print('[INFO] Skipping the combined flow preview: camera image sizes differ.')
+        return None
+    return np.stack(flow_video, axis=0)
 
 
 @torch.no_grad()
-def generate_waymo_flow(path, downsample, slide_window, num_cams=1):
+def _generate_ad_flow(path, downsample, slide_window, metadata_name,
+                      num_cams=None, legacy_num_cams=None,
+                      dataset_name='dataset', resume=False):
+    """Generate flow independently inside every metadata-defined camera stream."""
+    if slide_window <= 0:
+        raise ValueError('slide_window must be positive')
+
+    flow_folder = os.path.join(path, 'flow')
+    os.makedirs(flow_folder, exist_ok=True)
+    meta = np.load(os.path.join(path, metadata_name), allow_pickle=True)
+    K = np.asarray(meta['K'])
+    R = np.asarray(meta['R'])
+    T = np.asarray(meta['T'])
+    time_stamps = np.asarray(meta['time_stamps']).reshape(-1)
+    is_val_list = np.asarray(meta['is_val_list'], dtype=np.bool_).reshape(-1)
+    img_list = sorted(os.listdir(os.path.join(path, 'image')))
+    num_images = len(img_list)
+
+    for field_name, values in (
+        ('K', K), ('R', R), ('T', T), ('time_stamps', time_stamps),
+        ('is_val_list', is_val_list),
+    ):
+        if len(values) != num_images:
+            raise ValueError(
+                f'{dataset_name}: {field_name} has {len(values)} entries, '
+                f'but image/ has {num_images} files'
+            )
+    camera_ids = _metadata_camera_ids(
+        meta, num_images, num_cams, legacy_num_cams, dataset_name
+    )
+
+    camera_groups = _camera_groups(camera_ids, is_val_list, time_stamps)
+    resume_ready = set()
+    if resume:
+        resume_specs = _flow_resume_specs(
+            path, img_list, camera_groups, time_stamps, downsample, slide_window
+        )
+        resume_ready = _preflight_flow_resume(flow_folder, resume_specs)
+    preview_sizes = set()
+    for _, group_indices in camera_groups:
+        if not len(group_indices):
+            continue
+        with Image.open(
+            os.path.join(path, 'image', img_list[group_indices[0]])
+        ) as image:
+            width, height = image.size
+        if downsample is not None and downsample > 1:
+            width //= downsample
+            height //= downsample
+        preview_sizes.add((height, width))
+    preview_enabled = len(preview_sizes) <= 1
+    if not preview_enabled:
+        print(
+            '[INFO] Camera image sizes differ; per-image flow will be saved '
+            'without a combined preview video.'
+        )
+
+    flow_video = []
+    for camera_id, group_indices in camera_groups:
+        if not len(group_indices):
+            print(f'[WARNING] Camera {camera_id} has no training observations.')
+            continue
+
+        group_stems = {
+            os.path.splitext(img_list[global_idx])[0]
+            for global_idx in group_indices
+        }
+        if resume and group_stems.issubset(resume_ready):
+            print(
+                '[RESUME][FLOW CAMERA READY] camera={} ready={}'.format(
+                    camera_id, len(group_stems)
+                )
+            )
+            continue
+
+
+        images = []
+        masks = []
+        for global_idx in tqdm.tqdm(
+            group_indices, desc=f'Reading camera {camera_id}'
+        ):
+            image_name = img_list[global_idx]
+            stem = os.path.splitext(image_name)[0]
+            semantic_path = os.path.join(path, 'semantic', f'mask_{stem}.npy')
+            with Image.open(os.path.join(path, 'image', image_name)) as image:
+                image = np.asarray(image.convert('RGB'))
+            mask = (load_mask_prior(semantic_path, "semantic") > 0).astype(np.float32)
+            if mask.shape != image.shape[:2]:
+                raise ValueError(
+                    f'{dataset_name}: semantic mask {mask.shape} does not match '
+                    f'image {image_name} size {image.shape[:2]}'
+                )
+            images.append(image)
+            masks.append(mask)
+
+        # Only observations from one physical camera are stacked. This is what
+        # permits asynchronous AV2 cameras to have unequal counts and sizes.
+        try:
+            images = np.stack(images, axis=0)
+            masks = np.stack(masks, axis=0)
+        except ValueError as exc:
+            raise ValueError(
+                f'{dataset_name}: camera {camera_id} changes image dimensions '
+                f'within its own stream'
+            ) from exc
+        images = torch.as_tensor(images, dtype=torch.float32).permute(0, 3, 1, 2)
+        masks = torch.as_tensor(masks, dtype=torch.float32)
+        if downsample is not None and downsample > 1:
+            target_size = (
+                images.shape[2] // downsample, images.shape[3] // downsample
+            )
+            images = F.interpolate(images, size=target_size, mode='bilinear')
+            masks = F.interpolate(
+                masks[:, None], size=target_size, mode='bilinear'
+            )[:, 0]
+
+        H, W = images.shape[2:]
+        grid = torch.stack(torch.meshgrid(
+            torch.arange(0, W, dtype=torch.float32, device='cuda'),
+            torch.arange(0, H, dtype=torch.float32, device='cuda'),
+            indexing='xy',
+        ), dim=-1)
+
+        for local_idx, global_idx in enumerate(tqdm.tqdm(
+            group_indices, desc=f'Processing camera {camera_id}'
+        )):
+            image_stem = os.path.splitext(img_list[global_idx])[0]
+            if resume and image_stem in resume_ready:
+                continue
+            selected_coord = torch.nonzero(
+                masks[local_idx].cuda() > 0.5, as_tuple=True
+            )
+            pts = grid[selected_coord]
+            if pts.numel() == 0:
+                print(f'[WARNING] Image {image_stem} has no object detected.')
+                save_flow_prior(
+                    os.path.join(flow_folder, f'{image_stem}.npz'),
+                    np.asarray([], dtype=object),
+                )
+                continue
+            pts = torch.cat([
+                torch.zeros((pts.shape[0], 1), dtype=torch.float32, device='cuda'),
+                pts,
+            ], dim=-1)
+            flow = []
+
+            if local_idx + slide_window < len(group_indices):
+                window = images[local_idx:local_idx + slide_window + 1]
+                forward_pts, forward_vis = batchify(cotracker, window.cuda(), pts)
+                forward_pts, forward_vis = forward_pts[-1], forward_vis[-1]
+                forward_flow = grid.clone()
+                forward_flow_vis = torch.zeros(
+                    (H, W), dtype=torch.float32, device='cuda'
+                )
+                forward_flow[selected_coord] = forward_pts
+                forward_flow_vis[selected_coord] = forward_vis.float()
+                forward_flow = forward_flow.permute(2, 0, 1).cpu().numpy()
+                forward_flow_vis = forward_flow_vis.cpu().numpy()
+                target_global_idx = group_indices[local_idx + slide_window]
+                K_select = _scaled_intrinsic(K[target_global_idx], downsample)
+                if metadata_name == 'cameras.npz':
+                    K_select = _waymo_intrinsic_matrix(K_select)
+                flow.append([
+                    time_stamps[target_global_idx], K_select,
+                    R[target_global_idx], T[target_global_idx],
+                    forward_flow, forward_flow_vis,
+                ])
+                if preview_enabled:
+                    flow_img = flow_vis.flow_to_color(
+                        np.transpose(forward_flow, (1, 2, 0)) - grid.cpu().numpy()
+                    )
+                    flow_video.append(np.uint8(flow_img))
+
+            if local_idx >= slide_window:
+                reverse_indices = np.arange(
+                    local_idx, local_idx - slide_window - 1, -1
+                )
+                window = images[reverse_indices]
+                backward_pts, backward_vis = batchify(cotracker, window.cuda(), pts)
+                backward_pts, backward_vis = backward_pts[-1], backward_vis[-1]
+                backward_flow = grid.clone()
+                backward_flow_vis = torch.zeros(
+                    (H, W), dtype=torch.float32, device='cuda'
+                )
+                backward_flow[selected_coord] = backward_pts
+                backward_flow_vis[selected_coord] = backward_vis.float()
+                backward_flow = backward_flow.permute(2, 0, 1).cpu().numpy()
+                backward_flow_vis = backward_flow_vis.cpu().numpy()
+                target_global_idx = group_indices[local_idx - slide_window]
+                K_select = _scaled_intrinsic(K[target_global_idx], downsample)
+                if metadata_name == 'cameras.npz':
+                    K_select = _waymo_intrinsic_matrix(K_select)
+                flow.append([
+                    time_stamps[target_global_idx], K_select,
+                    R[target_global_idx], T[target_global_idx],
+                    backward_flow, backward_flow_vis,
+                ])
+
+            # Keep the converter's original image stem; metadata ordering need
+            # not be frame-major and AV2 camera streams have unequal lengths.
+            save_flow_prior(
+                os.path.join(flow_folder, f'{image_stem}.npz'),
+                np.asarray(flow, dtype=object),
+            )
+
+    return _stack_flow_preview(flow_video)
+
+
+@torch.no_grad()
+def _get_track_ad_video(path, metadata_name, downsample=None, start_frame=0,
+                        end_frame=-1, num_cams=None, legacy_num_cams=None,
+                        cam_id=0, dataset_name='dataset'):
+    meta = np.load(os.path.join(path, metadata_name), allow_pickle=True)
+    img_list = sorted(os.listdir(os.path.join(path, 'image')))
+    num_images = len(img_list)
+    time_stamps = np.asarray(meta['time_stamps']).reshape(-1)
+    if len(time_stamps) != num_images:
+        raise ValueError(
+            f'{dataset_name}: metadata has {len(time_stamps)} timestamps but '
+            f'image/ has {num_images} files'
+        )
+    camera_ids = _metadata_camera_ids(
+        meta, num_images, num_cams, legacy_num_cams, dataset_name
+    )
+    available = list(dict.fromkeys(camera_ids.tolist()))
+    if cam_id not in available:
+        raise ValueError(
+            f'{dataset_name}: requested --cam {cam_id}, available camera_ids '
+            f'are {available}'
+        )
+    indices = np.flatnonzero(camera_ids == cam_id)
+    indices = indices[np.argsort(time_stamps[indices], kind='stable')]
+    if end_frame == -1:
+        indices = indices[start_frame:]
+    else:
+        indices = indices[start_frame:end_frame + 1]
+    if not len(indices):
+        raise ValueError(f'{dataset_name}: selected camera/frame range is empty')
+
+    images = []
+    pts = None
+    for local_idx, global_idx in enumerate(indices):
+        image_name = img_list[global_idx]
+        stem = os.path.splitext(image_name)[0]
+        semantic_path = os.path.join(path, 'semantic', f'mask_{stem}.npy')
+        image = Image.open(os.path.join(path, 'image', image_name)).convert('RGB')
+        if downsample is not None and downsample > 1:
+            image = image.resize(
+                (image.width // downsample, image.height // downsample)
+            )
+        images.append(
+            torch.as_tensor(np.asarray(image), dtype=torch.float32).permute(2, 0, 1)
+        )
+        if local_idx == 0:
+            W, H = image.size
+            grid = torch.stack(torch.meshgrid(
+                torch.arange(0, W, dtype=torch.float32, device='cuda'),
+                torch.arange(0, H, dtype=torch.float32, device='cuda'),
+                indexing='xy',
+            ), dim=-1)
+            mask = torch.as_tensor(
+                (load_mask_prior(semantic_path, "semantic") > 0).astype(np.float32),
+                device='cuda', dtype=torch.float32,
+            )
+            mask = F.interpolate(
+                mask[None, None], size=(H, W), mode='bilinear'
+            ).squeeze()
+            selected_coord = torch.nonzero(mask > 0.5, as_tuple=True)
+            pts = grid[selected_coord]
+            pts = torch.cat([
+                torch.zeros((pts.shape[0], 1), dtype=torch.float32, device='cuda'),
+                pts,
+            ], dim=-1)
+
+    if pts is None or not pts.numel():
+        raise ValueError(f'{dataset_name}: first selected image has no track queries')
+    try:
+        images = torch.stack(images, dim=0)[None].cuda()
+    except RuntimeError as exc:
+        raise ValueError(
+            f'{dataset_name}: camera {cam_id} changes image dimensions '
+            f'within the selected range'
+        ) from exc
+    pts = pts[torch.randperm(pts.shape[0], device='cuda')[:1000]]
+    pred_tracks, pred_visibility = cotracker(images, queries=pts[None])
+    vis = Visualizer(
+        save_dir=os.path.join(path, 'flow_videos'),
+        pad_value=120, linewidth=3,
+    )
+    vis.visualize(images, pred_tracks, pred_visibility)
+    vis.save_video(images.byte(), 'origin')
+
+
+@torch.no_grad()
+def _generate_waymo_flow_legacy(path, downsample, slide_window, num_cams=1):
     flow_folder = os.path.join(path, 'flow')
     os.makedirs(flow_folder, exist_ok=True)
 
@@ -405,7 +925,7 @@ def generate_waymo_flow(path, downsample, slide_window, num_cams=1):
         semantic_path = os.path.join(path, "semantic", 'mask_' + img_path.split(".")[0] + ".npy")
         img_path = os.path.join(path, 'image', img_path)
         img = np.array(Image.open(img_path))
-        mask = (np.load(semantic_path) > 0).astype(np.float32)
+        mask = (load_mask_prior(semantic_path, "semantic") > 0).astype(np.float32)
         masks.append(mask)
         images.append(img)
         indices.append(idx)
@@ -481,11 +1001,27 @@ def generate_waymo_flow(path, downsample, slide_window, num_cams=1):
                 [0.0, 0.0, 1.0],
             ], dtype=np.float32)
             flow.append([time_stamps[idx - slide_window * num_cams], K_select, R[idx - slide_window * num_cams], T[idx - slide_window * num_cams], backward_flow, backward_flow_vis])
-        np.savez(os.path.join(flow_folder, '{:06d}.npz'.format(indices[idx])), flow=flow)
+        save_flow_prior(
+            os.path.join(flow_folder, '{:06d}.npz'.format(indices[idx])), flow
+        )
     flow_video = np.stack(flow_video, axis=0)
     return flow_video
 
-def get_track_waymo_video(path, downsample=None, start_frame=0, end_frame=-1, num_cams=1, cam_id=0):
+
+def generate_waymo_flow(path, downsample, slide_window, num_cams=None,
+                        resume=False):
+    return _generate_ad_flow(
+        path=path,
+        downsample=downsample,
+        slide_window=slide_window,
+        metadata_name='cameras.npz',
+        num_cams=num_cams,
+        legacy_num_cams=1,
+        dataset_name='Waymo',
+        resume=resume,
+    )
+
+def _get_track_waymo_video_legacy(path, downsample=None, start_frame=0, end_frame=-1, num_cams=1, cam_id=0):
     images = []
     pts = None
     for idx, img_path in enumerate(sorted(os.listdir(os.path.join(path, "image")))):
@@ -508,7 +1044,7 @@ def get_track_waymo_video(path, downsample=None, start_frame=0, end_frame=-1, nu
                 torch.arange(0, H, dtype=torch.float32, device='cuda'),
                 indexing='xy',
             ), dim=-1) # H, W, 2
-            mask = torch.tensor((np.load(semantic_path) > 0).astype(np.float32), device='cuda', dtype=torch.float32)
+            mask = torch.tensor((load_mask_prior(semantic_path, "semantic") > 0).astype(np.float32), device='cuda', dtype=torch.float32)
             mask = F.interpolate(mask[None, None], size=(H, W), mode='bilinear').squeeze()
             selected_coord = torch.nonzero(mask > 0.5, as_tuple=True)
             pts = grid[selected_coord]
@@ -521,6 +1057,21 @@ def get_track_waymo_video(path, downsample=None, start_frame=0, end_frame=-1, nu
     vis = Visualizer(save_dir=os.path.join(path, "flow_videos"), pad_value=120, linewidth=3)
     vis.visualize(images, pred_tracks, pred_visibility)
     vis.save_video(images.byte(), 'origin')
+
+
+def get_track_waymo_video(path, downsample=None, start_frame=0, end_frame=-1,
+                          num_cams=None, cam_id=0):
+    return _get_track_ad_video(
+        path=path,
+        metadata_name='cameras.npz',
+        downsample=downsample,
+        start_frame=start_frame,
+        end_frame=end_frame,
+        num_cams=num_cams,
+        legacy_num_cams=1,
+        cam_id=cam_id,
+        dataset_name='Waymo',
+    )
 
 def generate_kitti_flow(path, downsample, slide_window, split_mode='nvs-75', num_cams=2):
     flow_folder = os.path.join(path, 'flow', split_mode)
@@ -554,7 +1105,7 @@ def generate_kitti_flow(path, downsample, slide_window, split_mode='nvs-75', num
         semantic_path = os.path.join(path, "semantic", 'mask_' + img_path.split(".")[0] + ".npy")
         img_path = os.path.join(path, 'image', img_path)
         img = np.array(Image.open(img_path))
-        mask = (np.load(semantic_path) > 0).astype(np.float32)
+        mask = (load_mask_prior(semantic_path, "semantic") > 0).astype(np.float32)
         masks.append(mask)
         images.append(img)
     R, T, time_stamps = R[indices], T[indices], time_stamps[indices]
@@ -619,7 +1170,9 @@ def generate_kitti_flow(path, downsample, slide_window, split_mode='nvs-75', num
             backward_flow_vis = backward_flow_vis.detach().cpu().numpy()  # H, W
 
             flow.append([time_stamps[idx - slide_window * num_cams], K, R[idx - slide_window * num_cams], T[idx - slide_window * num_cams], backward_flow, backward_flow_vis])
-        np.savez(os.path.join(flow_folder, '{:06d}.npz'.format(indices[idx])), flow=flow)
+        save_flow_prior(
+            os.path.join(flow_folder, '{:06d}.npz'.format(indices[idx])), flow
+        )
     flow_video = np.stack(flow_video, axis=0)
     return flow_video
 
@@ -646,7 +1199,7 @@ def get_track_kitti_video(path, downsample=None, start_frame=0, end_frame=-1, nu
                 torch.arange(0, H, dtype=torch.float32, device='cuda'),
                 indexing='xy',
             ), dim=-1) # H, W, 2
-            mask = torch.tensor((np.load(semantic_path) > 0).astype(np.float32), device='cuda', dtype=torch.float32)
+            mask = torch.tensor((load_mask_prior(semantic_path, "semantic") > 0).astype(np.float32), device='cuda', dtype=torch.float32)
             mask = F.interpolate(mask[None, None], size=(H, W), mode='bilinear').squeeze()
             selected_coord = torch.nonzero(mask > 0.5, as_tuple=True)
             pts = grid[selected_coord]
@@ -660,7 +1213,7 @@ def get_track_kitti_video(path, downsample=None, start_frame=0, end_frame=-1, nu
     vis.visualize(images, pred_tracks, pred_visibility)
     vis.save_video(images.byte(), 'origin')
 
-def generate_nuscenes_flow(path, downsample, slide_window, num_cams=3):
+def _generate_nuscenes_flow_legacy(path, downsample, slide_window, num_cams=3):
     flow_folder = os.path.join(path, 'flow')
     os.makedirs(flow_folder, exist_ok=True)
 
@@ -676,7 +1229,7 @@ def generate_nuscenes_flow(path, downsample, slide_window, num_cams=3):
         semantic_path = os.path.join(path, "semantic", 'mask_' + img_path.split(".")[0] + ".npy")
         img_path = os.path.join(path, 'image', img_path)
         img = np.array(Image.open(img_path))
-        mask = (np.load(semantic_path) > 0).astype(np.float32)
+        mask = (load_mask_prior(semantic_path, "semantic") > 0).astype(np.float32)
         masks.append(mask)
         images.append(img)
         indices.append(idx)
@@ -746,11 +1299,27 @@ def generate_nuscenes_flow(path, downsample, slide_window, num_cams=3):
 
             K_select = K[idx - slide_window * num_cams]
             flow.append([time_stamps[idx - slide_window * num_cams], K_select, R[idx - slide_window * num_cams], T[idx - slide_window * num_cams], backward_flow, backward_flow_vis])
-        np.savez(os.path.join(flow_folder, '{:06d}.npz'.format(indices[idx])), flow=flow)
+        save_flow_prior(
+            os.path.join(flow_folder, '{:06d}.npz'.format(indices[idx])), flow
+        )
     flow_video = np.stack(flow_video, axis=0)
     return flow_video
 
-def get_track_nuscenes_video(path, downsample=None, start_frame=0, end_frame=-1, num_cams=3, cam_id=0):
+
+def generate_nuscenes_flow(path, downsample, slide_window, num_cams=None,
+                           resume=False):
+    return _generate_ad_flow(
+        path=path,
+        downsample=downsample,
+        slide_window=slide_window,
+        metadata_name='meta.npz',
+        num_cams=num_cams,
+        legacy_num_cams=3,
+        dataset_name='nuScenes/AV2',
+        resume=resume,
+    )
+
+def _get_track_nuscenes_video_legacy(path, downsample=None, start_frame=0, end_frame=-1, num_cams=3, cam_id=0):
     images = []
     pts = None
     for idx, img_path in enumerate(sorted(os.listdir(os.path.join(path, "image")))):
@@ -773,7 +1342,7 @@ def get_track_nuscenes_video(path, downsample=None, start_frame=0, end_frame=-1,
                 torch.arange(0, H, dtype=torch.float32, device='cuda'),
                 indexing='xy',
             ), dim=-1) # H, W, 2
-            mask = torch.tensor((np.load(semantic_path) > 0).astype(np.float32), device='cuda', dtype=torch.float32)
+            mask = torch.tensor((load_mask_prior(semantic_path, "semantic") > 0).astype(np.float32), device='cuda', dtype=torch.float32)
             mask = F.interpolate(mask[None, None], size=(H, W), mode='bilinear').squeeze()
             selected_coord = torch.nonzero(mask > 0.5, as_tuple=True)
             pts = grid[selected_coord]
@@ -786,6 +1355,21 @@ def get_track_nuscenes_video(path, downsample=None, start_frame=0, end_frame=-1,
     vis.visualize(images, pred_tracks, pred_visibility)
     vis.save_video(images.byte(), 'origin')
 
+
+def get_track_nuscenes_video(path, downsample=None, start_frame=0, end_frame=-1,
+                             num_cams=None, cam_id=0):
+    return _get_track_ad_video(
+        path=path,
+        metadata_name='meta.npz',
+        downsample=downsample,
+        start_frame=start_frame,
+        end_frame=end_frame,
+        num_cams=num_cams,
+        legacy_num_cams=3,
+        cam_id=cam_id,
+        dataset_name='nuScenes/AV2',
+    )
+
 if __name__ == '__main__':
     os.environ['HF_ENDPOINT'] = 'https://hf-mirror.com'
 
@@ -797,17 +1381,36 @@ if __name__ == '__main__':
     parser.add_argument('--start', default=0, type=int)
     parser.add_argument('--end', default=-1, type=int)
     parser.add_argument('--step', default=4, type=int)
-    parser.add_argument('--cam', default=0, type=int)  # only use to generate video
+    parser.add_argument(
+        '--resume', action='store_true',
+        help='validate and keep completed metadata-defined flow priors',
+    )
+    parser.add_argument(
+        '--cam', default=0, type=int,
+        help='metadata camera_id to preview (used only with --video)',
+    )
     parser.add_argument('--fps', default=10, type=int)
     parser.add_argument('--split_mode', default='nvs-75')
     args = parser.parse_args()
     torch.cuda.set_device(args.device)
     src_path = args.path
 
-    cotracker = torch.hub.load("facebookresearch/co-tracker", "cotracker3_offline").cuda()
-
-    # for cached model
-    # cotracker = torch.hub.load("/root/.cache/torch/hub/facebookresearch_co-tracker_main", "cotracker3_offline", trust_repo=True, source='local').cuda()
+    # Preparation already caches CoTracker. Load that exact local checkout so
+    # prior generation remains deterministic and needs no runtime network.
+    cotracker_hub = os.path.join(
+        torch.hub.get_dir(), "facebookresearch_co-tracker_main"
+    )
+    hubconf = os.path.join(cotracker_hub, "hubconf.py")
+    if not os.path.isfile(hubconf):
+        raise FileNotFoundError(
+            "Prepared CoTracker hub cache is missing: {}".format(hubconf)
+        )
+    cotracker = torch.hub.load(
+        cotracker_hub,
+        "cotracker3_offline",
+        trust_repo=True,
+        source="local",
+    ).cuda()
 
 
     flow_video = None
@@ -817,20 +1420,26 @@ if __name__ == '__main__':
         if args.video:
             get_track_waymo_video(args.path, args.downsample, args.start, args.end, cam_id=args.cam)
         else:
-            flow_video = generate_waymo_flow(args.path, args.downsample, args.step)
+            flow_video = generate_waymo_flow(
+                args.path, args.downsample, args.step, resume=args.resume
+            )
     elif os.path.exists(os.path.join(args.path, 'poses.npz')):
         print("Found poses.npz, assuming KITTI or vKITTI data set!")
         if args.video:
             get_track_kitti_video(args.path, args.downsample, args.start, args.end, cam_id=args.cam)
         else:
+            if args.resume:
+                raise ValueError('--resume is not supported for KITTI flow')
             flow_video = generate_kitti_flow(args.path, args.downsample, args.step, split_mode=args.split_mode)
             flow_video_path = os.path.join(args.path, 'flow-{}.mp4'.format(args.split_mode.split('-')[-1]))
     elif os.path.exists(os.path.join(args.path, "meta.npz")):
-        print("Found meta.npz file, assuming nuScenes data set!")
+        print("Found meta.npz file, assuming nuScenes or AV2 data set!")
         if args.video:
             get_track_nuscenes_video(args.path, args.downsample, args.start, args.end, cam_id=args.cam)
         else:
-            flow_video = generate_nuscenes_flow(args.path, args.downsample, args.step)
+            flow_video = generate_nuscenes_flow(
+                args.path, args.downsample, args.step, resume=args.resume
+            )
     else:
         assert False, 'Could not recognize scene type!'
         

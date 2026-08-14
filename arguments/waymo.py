@@ -1,4 +1,4 @@
-num_cam = 1
+num_cam = 3
 order_args = dict(
     # bspline(ctrl_pts, order - 1), poly, fft, slerp(ctrl_pts, order - 1)
     xyz = [None, 5, 0, 6, 0, 0],

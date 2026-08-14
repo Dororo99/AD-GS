@@ -8,21 +8,35 @@ from scene.cameras import Camera
 from utils.graphics_utils import fov2focal
 import open3d as o3d
 
-def get_image_cam_rays(focal, height, width):
-    K = torch.tensor([
-        [focal, 0.0, width / 2],
-        [0.0, focal, height / 2],
-        [0.0, 0.0, 1.0],
-    ], dtype=torch.float32, device='cuda')
-    K_inv = torch.inverse(K)
+def get_image_cam_rays(
+    focal,
+    height,
+    width,
+    fy=None,
+    cx=None,
+    cy=None,
+    pixel_center_offset=0.0,
+    device='cuda',
+):
+    """Return pinhole rays, retaining the legacy centered-camera defaults."""
+    fx = float(focal)
+    fy = fx if fy is None else float(fy)
+    cx = width / 2.0 if cx is None else float(cx)
+    cy = height / 2.0 if cy is None else float(cy)
     grid = torch.stack(torch.meshgrid(
-        torch.arange(0, width, dtype=torch.float32, device='cuda'),
-        torch.arange(0, height, dtype=torch.float32, device='cuda'),
+        torch.arange(0, width, dtype=torch.float32, device=device),
+        torch.arange(0, height, dtype=torch.float32, device=device),
         indexing='xy',
     ), dim=-1)  # H, W, 2
-    grid_pts = torch.cat([grid, torch.ones((grid.shape[0], grid.shape[1], 1), dtype=torch.float32, device='cuda')], dim=-1)[..., None]
-    pix_cam_ray = (K_inv @ grid_pts)
-    pix_cam_ray = normalize(pix_cam_ray[..., 0], p=2, dim=-1)
+    pix_cam_ray = torch.stack(
+        [
+            (grid[..., 0] + pixel_center_offset - cx) / fx,
+            (grid[..., 1] + pixel_center_offset - cy) / fy,
+            torch.ones_like(grid[..., 0]),
+        ],
+        dim=-1,
+    )
+    pix_cam_ray = normalize(pix_cam_ray, p=2, dim=-1)
     return pix_cam_ray, grid
 
 
@@ -43,18 +57,40 @@ class EnvironmentMap:
 
     def get_image_background(self, cam: Camera, use_cache=True, return_grid=False):
         use_cache = use_cache and self.use_cache
+        if cam.intrinsics is None:
+            ray_args = (
+                fov2focal(cam.FoVx, cam.image_width),
+                cam.image_height,
+                cam.image_width,
+            )
+            ray_kwargs = {}
+        else:
+            ray_args = (cam.fx, cam.image_height, cam.image_width)
+            ray_kwargs = {
+                'fy': cam.fy,
+                'cx': cam.cx,
+                'cy': cam.cy,
+                'pixel_center_offset': 0.5,
+            }
+        cache_key = (
+            cam.cam_id,
+            cam.image_height,
+            cam.image_width,
+            cam.fx,
+            cam.fy,
+            cam.cx,
+            cam.cy,
+        )
         if not use_cache:
-            focal = fov2focal(cam.FoVx, cam.image_width)
-            image_cam_rays, grid = get_image_cam_rays(focal, cam.image_height, cam.image_width)
+            image_cam_rays, grid = get_image_cam_rays(*ray_args, **ray_kwargs)
         else:
             try:
-                image_cam_rays = self.image_cam_rays[cam.cam_id]
-                grid = self.grid[cam.cam_id]
+                image_cam_rays = self.image_cam_rays[cache_key]
+                grid = self.grid[cache_key]
             except KeyError:
-                focal = fov2focal(cam.FoVx, cam.image_width)
-                image_cam_rays, grid = get_image_cam_rays(focal, cam.image_height, cam.image_width)
-                self.image_cam_rays[cam.cam_id] = image_cam_rays  # H, W, 3
-                self.grid[cam.cam_id] = grid
+                image_cam_rays, grid = get_image_cam_rays(*ray_args, **ray_kwargs)
+                self.image_cam_rays[cache_key] = image_cam_rays  # H, W, 3
+                self.grid[cache_key] = grid
         # image_cam_rays = (cam.world_view_transform[:3, :3].cuda().transpose(0, 1) @ image_cam_rays[..., None]).squeeze(-1)
         image_cam_rays = (cam.world_view_transform[:3, :3].cuda() @ image_cam_rays[..., None]).squeeze(-1)  # the matrix has already been rotated.
 

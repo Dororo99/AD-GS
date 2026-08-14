@@ -1,0 +1,30 @@
+# Python caches and test artifacts
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Local environments and editor files
+.venv/
+venv/
+.env
+.idea/
+.vscode/
+
+# Native extension build products
+*.so
+**/build/
+*.egg-info/
+dist/
+
+# Downloaded third-party model repositories and checkpoints
+/Depth-Anything-V2/
+/Grounded-SAM-2/
+*.ckpt
+*.pth
+*.pt
+
+# Datasets, preprocessing products, training outputs, and experiment logs
+/data/
+/output/
+/wandb/
+/runs/
